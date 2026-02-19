@@ -356,33 +356,6 @@ else
     fi
     FULL_AUTH_DONE=true
 
-    # ── Check billing ──
-    BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
-
-    if [ -z "$BILLING_ACCOUNTS" ]; then
-      echo ""
-      warn "You don't have a billing account yet."
-      hint "Cloud Functions requires billing to be enabled."
-      hint "You'll need a credit card on file."
-      echo ""
-      info "Let's set one up:"
-      hint "1. Go to: https://console.cloud.google.com/billing/create"
-      hint "2. Follow the prompts to add a payment method"
-      hint "3. Come back here when you're done"
-      echo ""
-      read -rp "  Press Enter when you've created a billing account..."
-
-      # Re-check
-      BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
-      if [ -z "$BILLING_ACCOUNTS" ]; then
-        fail "Still no billing account found."
-        hint "Go to https://console.cloud.google.com/billing/create and try again,"
-        hint "then re-run: make setup"
-        exit 1
-      fi
-      ok "Billing account found"
-    fi
-
     # ── Create project ──
     SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
     echo ""
@@ -412,28 +385,50 @@ else
     if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
 
     # ── Link billing ──
-    ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
-    if [ "$ACCOUNT_COUNT" -eq 1 ]; then
-      BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
-      BILLING_NAME=$(echo "$BILLING_ACCOUNTS" | cut -f2-)
-      spin "Linking billing account ($BILLING_NAME)" \
-        gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
-    else
-      info "Multiple billing accounts found:"
-      echo "$BILLING_ACCOUNTS" | awk '{printf "    %d) %s\n", NR, $0}'
-      echo ""
-      while true; do
-        read -rp "  Which one? [1]: " BILLING_CHOICE
-        BILLING_CHOICE="${BILLING_CHOICE:-1}"
-        BILLING_ID=$(echo "$BILLING_ACCOUNTS" | sed -n "${BILLING_CHOICE}p" | awk '{print $1}')
-        if [ -n "$BILLING_ID" ]; then break; fi
-        fail "Enter a number from the list above"
-      done
-      spin "Linking billing account" \
-        gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+    # Check for existing billing accounts. This can fail for new Google accounts
+    # or accounts without billing permissions, so we handle it gracefully.
+    BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+    BILLING_LINKED=false
+
+    if [ -n "$BILLING_ACCOUNTS" ]; then
+      ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
+      if [ "$ACCOUNT_COUNT" -eq 1 ]; then
+        BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
+        BILLING_NAME=$(echo "$BILLING_ACCOUNTS" | cut -f2-)
+        spin "Linking billing account ($BILLING_NAME)" \
+          gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+        BILLING_LINKED=true
+      else
+        info "Multiple billing accounts found:"
+        echo "$BILLING_ACCOUNTS" | awk '{printf "    %d) %s\n", NR, $0}'
+        echo ""
+        while true; do
+          read -rp "  Which one? [1]: " BILLING_CHOICE
+          BILLING_CHOICE="${BILLING_CHOICE:-1}"
+          BILLING_ID=$(echo "$BILLING_ACCOUNTS" | sed -n "${BILLING_CHOICE}p" | awk '{print $1}')
+          if [ -n "$BILLING_ID" ]; then break; fi
+          fail "Enter a number from the list above"
+        done
+        spin "Linking billing account" \
+          gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+        BILLING_LINKED=true
+      fi
     fi
 
-    ok "Project $GCP_PROJECT ready with billing enabled"
+    if $BILLING_LINKED; then
+      ok "Project $GCP_PROJECT ready with billing enabled"
+    else
+      echo ""
+      warn "Couldn't detect a billing account automatically."
+      hint "You'll need to link billing before deploying. Do it now in the browser:"
+      hint "  https://console.cloud.google.com/billing/linkedaccount?project=$GCP_PROJECT"
+      hint ""
+      hint "If you don't have a billing account yet, create one first:"
+      hint "  https://console.cloud.google.com/billing/create"
+      echo ""
+      read -rp "  Press Enter when billing is linked (or Ctrl-C to quit and re-run later)..."
+      ok "Continuing — billing will be verified during deploy"
+    fi
   fi
 
   # ── B) Drive folder ─────────────────────────────────────────────────
@@ -687,7 +682,11 @@ else
   fi
 fi
 
-if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
+if ! $DRY_RUN; then
+  gcloud config set project "$GCP_PROJECT" 2>/dev/null
+  # Set quota project for ADC to avoid "quota exceeded" / "API not enabled" errors
+  gcloud auth application-default set-quota-project "$GCP_PROJECT" 2>/dev/null || true
+fi
 ok "Active project: $GCP_PROJECT"
 
 # ── APIs ──
