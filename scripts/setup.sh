@@ -452,9 +452,39 @@ ENVEOF
       if $PROJECT_EXISTS; then
         ok "Project $GCP_PROJECT already exists — reusing it"
       else
-        spin "Creating project $GCP_PROJECT" \
-          gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
-        ok "Created project: $GCP_PROJECT"
+        # Run inline (not via spin) so we can catch specific errors like ToS
+        CREATE_LOG=$(mktemp)
+        CREATE_RC=0
+        printf "\r  ⏳ Creating project %s " "$GCP_PROJECT"
+        gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync" >"$CREATE_LOG" 2>&1 || CREATE_RC=$?
+
+        if [ $CREATE_RC -eq 0 ]; then
+          printf "\r  ${GREEN}✔${NC} Created project: %s          \n" "$GCP_PROJECT"
+        elif grep -q "Terms of Service" "$CREATE_LOG"; then
+          printf "\r  ${RED}✘${NC} Couldn't create the project — Google needs you to accept their Terms of Service first.\n"
+          echo ""
+          hint "This is a one-time thing. Here's what to do:"
+          hint "  1. Open: https://console.cloud.google.com"
+          hint "  2. You'll see a Terms of Service prompt — accept it"
+          hint "  3. Come back here and re-run: make setup"
+          echo ""
+          rm -f "$CREATE_LOG"
+          exit 1
+        elif grep -q "already in use" "$CREATE_LOG"; then
+          printf "\r  ${RED}✘${NC} That project ID is already taken by someone else.\n"
+          rm -f "$CREATE_LOG"
+          hint "Try a different name — re-run: make setup"
+          exit 1
+        else
+          printf "\r  ${RED}✘${NC} Creating project failed:\n"
+          echo ""
+          sed 's/^/      /' "$CREATE_LOG"
+          echo ""
+          hint "Fix the issue above and re-run: make setup"
+          rm -f "$CREATE_LOG"
+          exit 1
+        fi
+        rm -f "$CREATE_LOG"
       fi
       if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
 
