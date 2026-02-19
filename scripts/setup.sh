@@ -107,7 +107,7 @@ cleanup() {
   hint "You can safely re-run this — it picks up where it left off: make setup"
 }
 trap cleanup EXIT
-trap 'echo ""; echo "  Interrupted."; exit 130' INT
+trap 'echo ""; echo "  Interrupted."; ERROR_HANDLED=true; exit 130' INT
 
 # ── Banner ───────────────────────────────────────────────────────────
 echo ""
@@ -320,9 +320,16 @@ elif $DRY_RUN; then
   ok "Using placeholder values for missing fields [dry-run]"
   hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
 elif $AUTO; then
-  fail ".env not found. In non-interactive mode, .env must exist."
-  hint "Create it from the example:  cp .env.example .env"
-  hint "Then fill in the values and re-run."
+  if [ -f "$ENV_FILE" ]; then
+    fail ".env exists but is missing required values."
+    [ -z "${GCP_PROJECT:-}" ]    && hint "  Missing: GCP_PROJECT"
+    [ -z "${DRIVE_FOLDER_ID:-}" ] && hint "  Missing: DRIVE_FOLDER_ID"
+    [ -z "${GIT_REPO_URL:-}" ]   && hint "  Missing: GIT_REPO_URL"
+  else
+    fail ".env not found."
+    hint "Create it from the example:  cp .env.example .env"
+  fi
+  hint "Fill in the required values and re-run."
   ERROR_HANDLED=true; exit 1
 else
   # ── Check for previous partial run ──────────────────────────────────
@@ -351,21 +358,21 @@ else
   write_env() {
     cat > "$ENV_FILE" <<ENVEOF
 # === Required ===
-GCP_PROJECT=${GCP_PROJECT:-}
-DRIVE_FOLDER_ID=${DRIVE_FOLDER_ID:-}
-GIT_REPO_URL=${GIT_REPO_URL:-}
-GIT_BRANCH=${GIT_BRANCH:-main}
-GIT_TOKEN_SECRET=${GIT_TOKEN_SECRET:-git-token}
+GCP_PROJECT="${GCP_PROJECT:-}"
+DRIVE_FOLDER_ID="${DRIVE_FOLDER_ID:-}"
+GIT_REPO_URL="${GIT_REPO_URL:-}"
+GIT_BRANCH="${GIT_BRANCH:-main}"
+GIT_TOKEN_SECRET="${GIT_TOKEN_SECRET:-git-token}"
 
 # === Optional (uncomment to override defaults) ===
-# EXCLUDE_PATHS=Drafts/*,Archive/*
-# SKIP_EXTENSIONS=.zip,.exe,.dmg,.iso
+# EXCLUDE_PATHS="Drafts/*,Archive/*"
+# SKIP_EXTENSIONS=".zip,.exe,.dmg,.iso"
 # MAX_FILE_SIZE_MB=100
-# COMMIT_AUTHOR_NAME=Drive Sync Bot
-# COMMIT_AUTHOR_EMAIL=sync@example.com
-# FIRESTORE_COLLECTION=drive_sync_state
-# DOCS_SUBDIR=docs
-# GOOGLE_VERIFICATION_TOKEN=
+# COMMIT_AUTHOR_NAME="Drive Sync Bot"
+# COMMIT_AUTHOR_EMAIL="sync@example.com"
+# FIRESTORE_COLLECTION="drive_sync_state"
+# DOCS_SUBDIR="docs"
+# GOOGLE_VERIFICATION_TOKEN=""
 ENVEOF
   }
 
@@ -625,7 +632,7 @@ ENVEOF
           REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
 
           # Idempotent — skip if repo already exists (e.g. re-run after crash)
-          if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null 2>&1; then
+          if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null; then
             GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
             ok "Repo already exists: $GIT_REPO_URL"
           else
@@ -723,7 +730,7 @@ ENVEOF
       hint "Double-check that you gave it \"Contents: Read and write\" permission"
       hint "for the right repo."
       read -rp "  Continue anyway? [Y/n]: " CONTINUE
-      [[ "${CONTINUE:-Y}" =~ ^[Nn] ]] && exit 1
+      if [[ "${CONTINUE:-Y}" =~ ^[Nn] ]]; then ERROR_HANDLED=true; exit 1; fi
     fi
   elif [[ "$GIT_REPO_URL" =~ gitlab\.com[:/](.+) ]]; then
     GL_PATH="${BASH_REMATCH[1]%.git}"
@@ -737,7 +744,7 @@ ENVEOF
     elif [ "$HTTP_CODE" != "000" ]; then
       warn "Token doesn't seem to have access to $GL_PATH."
       read -rp "  Continue anyway? [Y/n]: " CONTINUE
-      [[ "${CONTINUE:-Y}" =~ ^[Nn] ]] && exit 1
+      if [[ "${CONTINUE:-Y}" =~ ^[Nn] ]]; then ERROR_HANDLED=true; exit 1; fi
     fi
   else
     ok "Token received (couldn't auto-verify for this host)"
@@ -882,7 +889,7 @@ hint "and deploys everything to Google Cloud. It takes a few minutes."
 # deploy.sh is idempotent via terraform, but it's slow — no need to re-run if nothing changed.
 DEPLOY_NEEDED=true
 if ! $DRY_RUN && [ -f "$ROOT_DIR/infra/terraform.tfstate" ]; then
-  if terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url &>/dev/null 2>&1; then
+  if terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url &>/dev/null; then
     DEPLOY_NEEDED=false
     ok "Already deployed from a previous run"
     hint "To force a fresh deploy: make deploy"
@@ -1054,7 +1061,11 @@ if $AUTO; then
   echo "  ACTION: Send POST request to start watching for Drive changes"
   echo "  COMMAND: curl -X POST \"${SETUP_URL}?initial_sync=true\" -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
   echo ""
-  if [ -z "$HAS_VERSION" ] && [ -z "${GIT_TOKEN_VALUE:-}" ]; then
+  TOKEN_STORED=false
+  [ -n "$HAS_VERSION" ] && TOKEN_STORED=true
+  # Also true if we just stored it during this run (HAS_VERSION was set before store_token)
+  gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null | grep -q . && TOKEN_STORED=true
+  if ! $TOKEN_STORED; then
     echo "WARNING: Git token not stored in Secret Manager."
     echo "  ACTION: Store token before initializing watch"
     echo "  COMMAND: echo -n 'YOUR_TOKEN' | gcloud secrets versions add $SECRET_NAME --data-file=-"
