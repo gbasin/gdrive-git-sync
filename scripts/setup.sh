@@ -282,15 +282,31 @@ phase "2/4" "Configuration"
 
 FULL_AUTH_DONE=false
 GIT_TOKEN_VALUE="${GIT_TOKEN_VALUE:-}"  # accept from env for agent mode
+ENV_COMPLETE=false
 
+# Load existing .env if present
 if [ -f "$ENV_FILE" ]; then
-  ok "Using existing .env"
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
-  hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
-  hint "To change settings, edit .env and re-run."
+
+  # Check if .env is complete or partial (from a previous crash)
+  if [ -n "${GCP_PROJECT:-}" ] && [ -n "${DRIVE_FOLDER_ID:-}" ] && [ -n "${GIT_REPO_URL:-}" ]; then
+    ok "Using existing .env"
+    hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
+    hint "To change settings, edit .env and re-run."
+    ENV_COMPLETE=true
+  else
+    info "Found partial .env from a previous run — picking up where we left off."
+    [ -n "${GCP_PROJECT:-}" ] && ok "GCP project: $GCP_PROJECT"
+    [ -n "${DRIVE_FOLDER_ID:-}" ] && ok "Drive folder: ${DRIVE_FOLDER_ID:0:20}..."
+    [ -n "${GIT_REPO_URL:-}" ] && ok "Git repo: $GIT_REPO_URL"
+  fi
+fi
+
+if $ENV_COMPLETE; then
+  : # nothing to do — .env is complete
 elif $DRY_RUN && [ ! -f "$ENV_FILE" ]; then
   ok "Using placeholder values [dry-run]"
   GCP_PROJECT="my-project-12345"
@@ -306,206 +322,275 @@ elif $AUTO; then
   hint "Then fill in the values and re-run."
   exit 1
 else
-  info "We need four things. I'll walk you through each one."
-
-  # ── A) GCP project ──────────────────────────────────────────────────
-  echo ""
-  printf "  ${BOLD}A) Google Cloud project${NC}\n"
-  hint "This is where your Cloud Functions, database, and secrets will live."
-  hint "It runs on Google Cloud Platform (GCP)."
-  echo ""
-  read -rp "  Do you already have a GCP project for this? [y/N]: " HAS_PROJECT
-
-  if [[ "${HAS_PROJECT:-}" =~ ^[Yy] ]]; then
-    hint "Find your project ID at console.cloud.google.com — it's the lowercase"
-    hint "string in the URL or project switcher (e.g. \"drive-sync-429301\")."
+  # ── Check for previous partial run ──────────────────────────────────
+  # If gcloud has a project set from a previous run that crashed before
+  # .env was written, recover it instead of starting over.
+  PREV_PROJECT=$(sim "" gcloud config get-value project 2>/dev/null || true)
+  if [ -n "$PREV_PROJECT" ] && [[ "$PREV_PROJECT" =~ ^[a-z] ]] && [[ "$PREV_PROJECT" != "NONE" ]]; then
     echo ""
-    while true; do
-      read -rp "  Project ID: " GCP_PROJECT
-      if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
-        break
+    info "Found GCP project from a previous run: $PREV_PROJECT"
+    read -rp "  Continue with this project? [Y/n]: " USE_PREV
+    if [[ ! "${USE_PREV:-Y}" =~ ^[Nn] ]]; then
+      GCP_PROJECT="$PREV_PROJECT"
+      ok "Using project $GCP_PROJECT"
+      # Check auth state
+      CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+      if [ -n "$CURRENT_ACCOUNT" ]; then
+        ok "Authenticated as $CURRENT_ACCOUNT"
+        FULL_AUTH_DONE=true
       fi
-      fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
-      hint "Example: my-project-123456"
-    done
-  else
-    hint "No problem — we'll create one. You'll need:"
-    hint "  • A Google account (any Gmail address works)"
-    hint "  • A billing account with a credit card on file"
-    hint "    (there's a generous free tier for low-usage projects like this)"
-
-    # ── Auth (both gcloud + ADC together) ──
-    echo ""
-    CURRENT_ACCOUNT=$(sim "dryrun@example.com" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
-    if [ -n "$CURRENT_ACCOUNT" ]; then
-      ok "Already logged in as $CURRENT_ACCOUNT"
     else
-      info "Let's log in to Google Cloud. Two browser windows will open:"
-      hint "1) Sign in with the Google account you want to use for this project"
-      hint "2) Authorize Terraform (the tool that sets up your infrastructure)"
-      echo ""
-      read -rp "  Press Enter to open the browser..."
-      if ! $DRY_RUN; then gcloud auth login; fi
-      ok "Logged in to gcloud"
-    fi
-    ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
-    if [ ! -f "$ADC_FILE" ] && ! $DRY_RUN; then
-      info "One more sign-in — this one is for Terraform..."
-      gcloud auth application-default login
-      ok "Terraform credentials saved"
-    fi
-    FULL_AUTH_DONE=true
-
-    # ── Create project ──
-    SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
-    echo ""
-    read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
-    GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
-
-    while ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; do
-      fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
-      read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
-      GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
-    done
-
-    # Idempotent — skip if project already exists (e.g. re-run after partial failure)
-    PROJECT_EXISTS=false
-    if $DRY_RUN; then
-      PROJECT_EXISTS=false  # simulate creation path in dry-run
-    elif gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
-      PROJECT_EXISTS=true
-    fi
-
-    if $PROJECT_EXISTS; then
-      ok "Project $GCP_PROJECT already exists"
-    else
-      spin "Creating project $GCP_PROJECT" \
-        gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
-    fi
-    if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
-
-    # ── Link billing ──
-    # Check for existing billing accounts. This can fail for new Google accounts
-    # or accounts without billing permissions, so we handle it gracefully.
-    BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
-    BILLING_LINKED=false
-
-    if [ -n "$BILLING_ACCOUNTS" ]; then
-      ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
-      if [ "$ACCOUNT_COUNT" -eq 1 ]; then
-        BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
-        BILLING_NAME=$(echo "$BILLING_ACCOUNTS" | cut -f2-)
-        spin "Linking billing account ($BILLING_NAME)" \
-          gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
-        BILLING_LINKED=true
-      else
-        info "Multiple billing accounts found:"
-        echo "$BILLING_ACCOUNTS" | awk '{printf "    %d) %s\n", NR, $0}'
-        echo ""
-        while true; do
-          read -rp "  Which one? [1]: " BILLING_CHOICE
-          BILLING_CHOICE="${BILLING_CHOICE:-1}"
-          BILLING_ID=$(echo "$BILLING_ACCOUNTS" | sed -n "${BILLING_CHOICE}p" | awk '{print $1}')
-          if [ -n "$BILLING_ID" ]; then break; fi
-          fail "Enter a number from the list above"
-        done
-        spin "Linking billing account" \
-          gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
-        BILLING_LINKED=true
-      fi
-    fi
-
-    if $BILLING_LINKED; then
-      ok "Project $GCP_PROJECT ready with billing enabled"
-    else
-      echo ""
-      warn "Couldn't detect a billing account automatically."
-      hint "You'll need to link billing before deploying. Do it now in the browser:"
-      hint "  https://console.cloud.google.com/billing/linkedaccount?project=$GCP_PROJECT"
-      hint ""
-      hint "If you don't have a billing account yet, create one first:"
-      hint "  https://console.cloud.google.com/billing/create"
-      echo ""
-      read -rp "  Press Enter when billing is linked (or Ctrl-C to quit and re-run later)..."
-      ok "Continuing — billing will be verified during deploy"
+      PREV_PROJECT=""
     fi
   fi
 
-  # ── B) Drive folder ─────────────────────────────────────────────────
-  echo ""
-  printf "  ${BOLD}B) Google Drive folder${NC}\n"
-  hint "Which Drive folder should we watch for changes?"
-  hint "  1. Go to drive.google.com"
-  hint "  2. Open the folder you want to sync (or create a new one)"
-  hint "  3. Look at the URL bar — it'll look like:"
-  hint "     drive.google.com/drive/folders/1aBcD_eFgHiJkLmNoPqRsTuVwXyZ"
-  hint "You can paste the whole URL or just the ID part after /folders/."
-  echo ""
-  while true; do
-    read -rp "  Folder ID or URL: " FOLDER_INPUT
-    if [[ "$FOLDER_INPUT" =~ /folders/([a-zA-Z0-9_-]+) ]]; then
-      DRIVE_FOLDER_ID="${BASH_REMATCH[1]}"
-      ok "Got it — extracted ID: ${DRIVE_FOLDER_ID:0:20}..."
-      break
-    elif [[ "$FOLDER_INPUT" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
-      DRIVE_FOLDER_ID="$FOLDER_INPUT"
-      break
+  # Helper: write .env with whatever we have so far, so progress survives crashes.
+  write_env() {
+    cat > "$ENV_FILE" <<ENVEOF
+# === Required ===
+GCP_PROJECT=${GCP_PROJECT:-}
+DRIVE_FOLDER_ID=${DRIVE_FOLDER_ID:-}
+GIT_REPO_URL=${GIT_REPO_URL:-}
+GIT_BRANCH=${GIT_BRANCH:-main}
+GIT_TOKEN_SECRET=${GIT_TOKEN_SECRET:-git-token}
+
+# === Optional (uncomment to override defaults) ===
+# EXCLUDE_PATHS=Drafts/*,Archive/*
+# SKIP_EXTENSIONS=.zip,.exe,.dmg,.iso
+# MAX_FILE_SIZE_MB=100
+# COMMIT_AUTHOR_NAME=Drive Sync Bot
+# COMMIT_AUTHOR_EMAIL=sync@example.com
+# FIRESTORE_COLLECTION=drive_sync_state
+# DOCS_SUBDIR=docs
+# GOOGLE_VERIFICATION_TOKEN=
+ENVEOF
+  }
+
+  if [ -z "${GCP_PROJECT:-}" ]; then
+    info "We need four things. I'll walk you through each one."
+
+    # ── A) GCP project ──────────────────────────────────────────────────
+    echo ""
+    printf "  ${BOLD}A) Google Cloud project${NC}\n"
+    hint "This is where your Cloud Functions, database, and secrets will live."
+    hint "It runs on Google Cloud Platform (GCP)."
+    echo ""
+    read -rp "  Do you already have a GCP project for this? [y/N]: " HAS_PROJECT
+
+    if [[ "${HAS_PROJECT:-}" =~ ^[Yy] ]]; then
+      hint "Find your project ID at console.cloud.google.com — it's the lowercase"
+      hint "string in the URL or project switcher (e.g. \"drive-sync-429301\")."
+      echo ""
+      while true; do
+        read -rp "  Project ID: " GCP_PROJECT
+        if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+          break
+        fi
+        fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
+        hint "Example: my-project-123456"
+      done
+    else
+      hint "No problem — we'll create one. You'll need:"
+      hint "  • A Google account (any Gmail address works)"
+      hint "  • A billing account with a credit card on file"
+      hint "    (there's a generous free tier for low-usage projects like this)"
+
+      # ── Auth (both gcloud + ADC together) ──
+      echo ""
+      CURRENT_ACCOUNT=$(sim "dryrun@example.com" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+      if [ -n "$CURRENT_ACCOUNT" ]; then
+        ok "Already logged in as $CURRENT_ACCOUNT"
+      else
+        info "Let's log in to Google Cloud. Two browser windows will open:"
+        hint "1) Sign in with the Google account you want to use for this project"
+        hint "2) Authorize Terraform (the tool that sets up your infrastructure)"
+        echo ""
+        read -rp "  Press Enter to open the browser..."
+        if ! $DRY_RUN; then gcloud auth login; fi
+        ok "Logged in to gcloud"
+      fi
+      ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
+      if [ ! -f "$ADC_FILE" ] && ! $DRY_RUN; then
+        info "One more sign-in — this one is for Terraform..."
+        gcloud auth application-default login
+        ok "Terraform credentials saved"
+      fi
+      FULL_AUTH_DONE=true
+
+      # ── Create project ──
+      SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
+      echo ""
+      read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
+      GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
+
+      while ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; do
+        fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
+        read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
+        GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
+      done
+
+      # Idempotent — skip if project already exists (e.g. re-run after partial failure)
+      PROJECT_EXISTS=false
+      if $DRY_RUN; then
+        PROJECT_EXISTS=false  # simulate creation path in dry-run
+      elif gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
+        PROJECT_EXISTS=true
+      fi
+
+      if $PROJECT_EXISTS; then
+        ok "Project $GCP_PROJECT already exists"
+      else
+        spin "Creating project $GCP_PROJECT" \
+          gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
+      fi
+      if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
+
+      # ── Link billing ──
+      # Check for existing billing accounts. This can fail for new Google accounts
+      # or accounts without billing permissions, so we handle it gracefully.
+      BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+      BILLING_LINKED=false
+
+      if [ -n "$BILLING_ACCOUNTS" ]; then
+        ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
+        if [ "$ACCOUNT_COUNT" -eq 1 ]; then
+          BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
+          BILLING_NAME=$(echo "$BILLING_ACCOUNTS" | cut -f2-)
+          spin "Linking billing account ($BILLING_NAME)" \
+            gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+          BILLING_LINKED=true
+        else
+          info "Multiple billing accounts found:"
+          echo "$BILLING_ACCOUNTS" | awk '{printf "    %d) %s\n", NR, $0}'
+          echo ""
+          while true; do
+            read -rp "  Which one? [1]: " BILLING_CHOICE
+            BILLING_CHOICE="${BILLING_CHOICE:-1}"
+            BILLING_ID=$(echo "$BILLING_ACCOUNTS" | sed -n "${BILLING_CHOICE}p" | awk '{print $1}')
+            if [ -n "$BILLING_ID" ]; then break; fi
+            fail "Enter a number from the list above"
+          done
+          spin "Linking billing account" \
+            gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+          BILLING_LINKED=true
+        fi
+      fi
+
+      if $BILLING_LINKED; then
+        ok "Project $GCP_PROJECT ready with billing enabled"
+      else
+        echo ""
+        warn "Couldn't detect a billing account automatically."
+        hint "You'll need to link billing before deploying. Do it now in the browser:"
+        hint "  https://console.cloud.google.com/billing/linkedaccount?project=$GCP_PROJECT"
+        hint ""
+        hint "If you don't have a billing account yet, create one first:"
+        hint "  https://console.cloud.google.com/billing/create"
+        echo ""
+        read -rp "  Press Enter when billing is linked (or Ctrl-C to quit and re-run later)..."
+        ok "Continuing — billing will be verified during deploy"
+      fi
     fi
-    fail "That doesn't look like a folder ID or Drive URL"
-    hint "Open your folder in Drive and copy the URL from the browser address bar"
-  done
 
-  # ── C) Git repository ───────────────────────────────────────────────
-  echo ""
-  printf "  ${BOLD}C) Git repository${NC}\n"
-  hint "This is where synced files get pushed as git commits."
-  echo ""
-  read -rp "  Do you already have a repo for this? [y/N]: " HAS_REPO
+    # Save progress — project is the hardest part to redo
+    write_env
+  else
+    ok "GCP project: $GCP_PROJECT"
+  fi
 
-  if [[ "${HAS_REPO:-}" =~ ^[Yy] ]]; then
-    hint "Copy the HTTPS clone URL from your repo page."
+  # ── B) Drive folder ─────────────────────────────────────────────────
+  if [ -z "${DRIVE_FOLDER_ID:-}" ]; then
+    echo ""
+    printf "  ${BOLD}B) Google Drive folder${NC}\n"
+    hint "Which Drive folder should we watch for changes?"
+    hint "  1. Go to drive.google.com"
+    hint "  2. Open the folder you want to sync (or create a new one)"
+    hint "  3. Look at the URL bar — it'll look like:"
+    hint "     drive.google.com/drive/folders/1aBcD_eFgHiJkLmNoPqRsTuVwXyZ"
+    hint "You can paste the whole URL or just the ID part after /folders/."
     echo ""
     while true; do
-      read -rp "  Repo URL: " GIT_REPO_URL
-      if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
+      read -rp "  Folder ID or URL: " FOLDER_INPUT
+      if [[ "$FOLDER_INPUT" =~ /folders/([a-zA-Z0-9_-]+) ]]; then
+        DRIVE_FOLDER_ID="${BASH_REMATCH[1]}"
+        ok "Got it — extracted ID: ${DRIVE_FOLDER_ID:0:20}..."
+        break
+      elif [[ "$FOLDER_INPUT" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
+        DRIVE_FOLDER_ID="$FOLDER_INPUT"
         break
       fi
-      fail "Needs to be an HTTPS URL (starts with https://)"
-      hint "Example: https://github.com/yourname/your-repo.git"
+      fail "That doesn't look like a folder ID or Drive URL"
+      hint "Open your folder in Drive and copy the URL from the browser address bar"
     done
+    write_env
   else
-    # Check if gh CLI is available
-    if command -v gh &>/dev/null; then
-      GH_USER=$(sim "dryrunuser" gh api user --jq .login 2>/dev/null || true)
-      if [ -z "$GH_USER" ] && ! $DRY_RUN; then
-        info "GitHub CLI is installed but not logged in. Let's fix that."
-        gh auth login
-        GH_USER=$(gh api user --jq .login 2>/dev/null || true)
-      fi
-      if [ -n "$GH_USER" ]; then
-        hint "We'll create a GitHub repo for you (logged in as @$GH_USER)."
-        SUGGESTED_REPO="drive-sync"
-        echo ""
-        read -rp "  Repo name [$SUGGESTED_REPO]: " REPO_NAME
-        REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
+    ok "Drive folder: ${DRIVE_FOLDER_ID:0:20}..."
+  fi
 
-        # Idempotent — skip if repo already exists (e.g. re-run after crash)
-        if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null 2>&1; then
-          GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
-          ok "Repo $GH_USER/$REPO_NAME already exists"
+  # ── C) Git repository ───────────────────────────────────────────────
+  if [ -z "${GIT_REPO_URL:-}" ]; then
+    echo ""
+    printf "  ${BOLD}C) Git repository${NC}\n"
+    hint "This is where synced files get pushed as git commits."
+    echo ""
+    read -rp "  Do you already have a repo for this? [y/N]: " HAS_REPO
+
+    if [[ "${HAS_REPO:-}" =~ ^[Yy] ]]; then
+      hint "Copy the HTTPS clone URL from your repo page."
+      echo ""
+      while true; do
+        read -rp "  Repo URL: " GIT_REPO_URL
+        if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
+          break
+        fi
+        fail "Needs to be an HTTPS URL (starts with https://)"
+        hint "Example: https://github.com/yourname/your-repo.git"
+      done
+    else
+      # Check if gh CLI is available
+      if command -v gh &>/dev/null; then
+        GH_USER=$(sim "dryrunuser" gh api user --jq .login 2>/dev/null || true)
+        if [ -z "$GH_USER" ] && ! $DRY_RUN; then
+          info "GitHub CLI is installed but not logged in. Let's fix that."
+          gh auth login
+          GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+        fi
+        if [ -n "$GH_USER" ]; then
+          hint "We'll create a GitHub repo for you (logged in as @$GH_USER)."
+          SUGGESTED_REPO="drive-sync"
+          echo ""
+          read -rp "  Repo name [$SUGGESTED_REPO]: " REPO_NAME
+          REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
+
+          # Idempotent — skip if repo already exists (e.g. re-run after crash)
+          if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null 2>&1; then
+            GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+            ok "Repo $GH_USER/$REPO_NAME already exists"
+          else
+            read -rp "  Private repo? [Y/n]: " REPO_PRIVATE
+            PRIVATE_FLAG="--private"
+            [[ "${REPO_PRIVATE:-Y}" =~ ^[Nn] ]] && PRIVATE_FLAG="--public"
+
+            spin "Creating GitHub repo $GH_USER/$REPO_NAME" \
+              gh repo create "$REPO_NAME" $PRIVATE_FLAG --clone=false --description "Drive files version-controlled in git"
+            GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+            ok "Created $GIT_REPO_URL"
+          fi
         else
-          read -rp "  Private repo? [Y/n]: " REPO_PRIVATE
-          PRIVATE_FLAG="--private"
-          [[ "${REPO_PRIVATE:-Y}" =~ ^[Nn] ]] && PRIVATE_FLAG="--public"
-
-          spin "Creating GitHub repo $GH_USER/$REPO_NAME" \
-            gh repo create "$REPO_NAME" $PRIVATE_FLAG --clone=false --description "Drive files version-controlled in git"
-          GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
-          ok "Created $GIT_REPO_URL"
+          fail "Couldn't detect GitHub user. Let's enter the repo URL manually."
+          hint "Create a repo at https://github.com/new, then paste the HTTPS URL."
+          echo ""
+          while true; do
+            read -rp "  Repo URL: " GIT_REPO_URL
+            if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then break; fi
+            fail "Needs to be an HTTPS URL (starts with https://)"
+          done
         fi
       else
-        fail "Couldn't detect GitHub user. Let's enter the repo URL manually."
-        hint "Create a repo at https://github.com/new, then paste the HTTPS URL."
+        hint "Create a repo on GitHub, GitLab, or any git host:"
+        hint "  GitHub: https://github.com/new"
+        hint "  GitLab: https://gitlab.com/projects/new"
+        hint "Then copy the HTTPS clone URL."
         echo ""
         while true; do
           read -rp "  Repo URL: " GIT_REPO_URL
@@ -513,22 +598,14 @@ else
           fail "Needs to be an HTTPS URL (starts with https://)"
         done
       fi
-    else
-      hint "Create a repo on GitHub, GitLab, or any git host:"
-      hint "  GitHub: https://github.com/new"
-      hint "  GitLab: https://gitlab.com/projects/new"
-      hint "Then copy the HTTPS clone URL."
-      echo ""
-      while true; do
-        read -rp "  Repo URL: " GIT_REPO_URL
-        if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then break; fi
-        fail "Needs to be an HTTPS URL (starts with https://)"
-      done
     fi
-  fi
 
-  read -rp "  Branch to push to [main]: " GIT_BRANCH
-  GIT_BRANCH="${GIT_BRANCH:-main}"
+    read -rp "  Branch to push to [main]: " GIT_BRANCH
+    GIT_BRANCH="${GIT_BRANCH:-main}"
+    write_env
+  else
+    ok "Git repo: $GIT_REPO_URL"
+  fi
 
   # ── D) Git personal access token ────────────────────────────────────
   echo ""
@@ -609,26 +686,8 @@ else
 
   GIT_TOKEN_SECRET="git-token"
 
-  # ── Write .env ──
-  cat > "$ENV_FILE" <<EOF
-# === Required ===
-GCP_PROJECT=${GCP_PROJECT}
-DRIVE_FOLDER_ID=${DRIVE_FOLDER_ID}
-GIT_REPO_URL=${GIT_REPO_URL}
-GIT_BRANCH=${GIT_BRANCH}
-GIT_TOKEN_SECRET=${GIT_TOKEN_SECRET}
-
-# === Optional (uncomment to override defaults) ===
-# EXCLUDE_PATHS=Drafts/*,Archive/*
-# SKIP_EXTENSIONS=.zip,.exe,.dmg,.iso
-# MAX_FILE_SIZE_MB=100
-# COMMIT_AUTHOR_NAME=Drive Sync Bot
-# COMMIT_AUTHOR_EMAIL=sync@example.com
-# FIRESTORE_COLLECTION=drive_sync_state
-# DOCS_SUBDIR=docs
-# GOOGLE_VERIFICATION_TOKEN=
-EOF
-
+  # ── Final .env write ──
+  write_env
   set -a; source "$ENV_FILE"; set +a
   echo ""
   ok ".env saved"
