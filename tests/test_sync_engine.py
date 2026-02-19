@@ -1299,12 +1299,7 @@ class TestStageChangeFilesEdgeCases:
         assert "docs/b/file.txt" in stage_calls
 
     def test_add_google_doc_stages_exported_and_extracted(self):
-        """Stages new_path and extracted file for Google Docs.
-
-        NOTE: This reflects current behavior where new_path="My Doc" is staged,
-        but _download_and_extract writes to "My Doc.docx". The multi-author
-        staging path has a mismatch for Google-native files — tracked separately.
-        """
+        """Stages the exported .docx path and extracted .docx.md for Google Docs."""
         from sync_engine import Change, ChangeType, _stage_change_files
 
         mock_repo = MagicMock()
@@ -1320,8 +1315,68 @@ class TestStageChangeFilesEdgeCases:
         _stage_change_files(change, mock_repo, "docs")
 
         stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
-        assert "docs/My Doc" in stage_calls
+        assert "docs/My Doc.docx" in stage_calls
         assert "docs/My Doc.docx.md" in stage_calls
+
+    def test_add_google_slides_stages_exported_pdf_and_txt(self):
+        """Google Slides stages the exported .pdf and extracted .pdf.txt."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Deck",
+            file_data={
+                "name": "Deck",
+                "mimeType": "application/vnd.google-apps.presentation",
+            },
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Deck.pdf" in stage_calls
+        assert "docs/Deck.pdf.txt" in stage_calls
+
+    def test_add_google_sheet_stages_exported_csv_and_txt(self):
+        """Google Sheets stages the exported .csv and extracted .csv.txt."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Budget",
+            file_data={
+                "name": "Budget",
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+            },
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Budget.csv" in stage_calls
+        assert "docs/Budget.csv.txt" in stage_calls
+
+    def test_add_google_doc_in_subfolder_stages_correct_paths(self):
+        """Google Doc in a subfolder stages exported and extracted with correct dir."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Reports/My Doc",
+            file_data={
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+            },
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Reports/My Doc.docx" in stage_calls
+        assert "docs/Reports/My Doc.docx.md" in stage_calls
 
     def test_add_pdf_stages_original_and_txt(self):
         from sync_engine import Change, ChangeType, _stage_change_files
@@ -1341,3 +1396,318 @@ class TestStageChangeFilesEdgeCases:
         stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
         assert "docs/Reports/invoice.pdf" in stage_calls
         assert "docs/Reports/invoice.pdf.txt" in stage_calls
+
+
+# ---------------------------------------------------------------------------
+# run_sync (full orchestrator)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSync:
+    """Tests for the run_sync orchestrator (sync_engine lines 47-122).
+
+    All three dependencies — DriveClient, StateManager, GitRepo — are mocked.
+    extract_text is patched so _download_and_extract creates the output file.
+    """
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        """Side effect for extract_text that creates the output file."""
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    def _raw_change(self, file_id="fileId1", file_data=None):
+        """Build a raw changes.list entry."""
+        return {"fileId": file_id, "file": file_data or _make_file_data()}
+
+    # -- 1. First run: no page token -------------------------------------------
+
+    def test_first_run_no_page_token(self, mock_drive, mock_state):
+        """state has no page token -> get initial token, set it, return 0."""
+        from sync_engine import run_sync
+
+        mock_state.get_page_token.return_value = None
+        mock_drive.get_start_page_token.return_value = "initial_token_42"
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_drive.get_start_page_token.assert_called_once()
+        mock_state.set_page_token.assert_called_once_with("initial_token_42")
+        # Should NOT clone, push, or list changes
+        mock_repo.clone.assert_not_called()
+        mock_drive.list_changes.assert_not_called()
+
+    # -- 2. No changes returns zero --------------------------------------------
+
+    def test_no_changes_returns_zero(self, mock_drive, mock_state):
+        """Page token exists, list_changes returns empty -> update token, return 0."""
+        from sync_engine import run_sync
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_drive.list_changes.return_value = ([], "token_2")
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_state.set_page_token.assert_called_once_with("token_2")
+        mock_repo.clone.assert_not_called()
+
+    # -- 3. All changes skipped returns zero -----------------------------------
+
+    def test_all_changes_skipped_returns_zero(self, mock_drive, mock_state):
+        """Changes exist but all classify as SKIP -> update token, return 0."""
+        from sync_engine import run_sync
+
+        mock_state.get_page_token.return_value = "token_1"
+        # Same md5 as existing -> SKIP
+        file_data = _make_file_data(md5="same_md5")
+        mock_drive.list_changes.return_value = (
+            [self._raw_change(file_data=file_data)],
+            "token_2",
+        )
+        mock_state.get_file.return_value = {
+            "name": "file.docx",
+            "path": "Reports/file.docx",
+            "md5": "same_md5",
+        }
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_state.set_page_token.assert_called_once_with("token_2")
+        mock_repo.clone.assert_not_called()
+
+    # -- 4. Single file add — full pipeline ------------------------------------
+
+    @patch("sync_engine.extract_text")
+    def test_single_file_add_full_pipeline(self, mock_extract, mock_drive, mock_state):
+        """One new file: download, extract, commit, push, update state."""
+        from sync_engine import run_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.return_value = None  # new file
+
+        file_data = _make_file_data(name="report.docx", md5="abc123")
+        mock_drive.list_changes.return_value = (
+            [self._raw_change(file_id="f1", file_data=file_data)],
+            "token_2",
+        )
+        mock_drive.download_file.return_value = b"docx bytes"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        # Verify the full sequence
+        mock_repo.clone.assert_called_once()
+        mock_drive.download_file.assert_called_once_with("f1")
+        mock_extract.assert_called_once()
+        mock_repo.commit.assert_called_once()
+        mock_repo.push.assert_called_once()
+        # State updated after push
+        mock_state.set_file.assert_called_once()
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["name"] == "report.docx"
+        assert stored["md5"] == "abc123"
+        mock_state.set_page_token.assert_called_with("token_2")
+
+    # -- 5. Push failure does NOT update state ---------------------------------
+
+    @patch("sync_engine.extract_text")
+    def test_push_failure_does_not_update_state(self, mock_extract, mock_drive, mock_state):
+        """If push raises, state should NOT be updated (page token and file state stay unchanged).
+
+        This is a critical data-consistency test: a push failure means the git
+        remote was not updated, so Firestore must not advance either.
+        """
+        from sync_engine import run_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.return_value = None  # new file
+
+        file_data = _make_file_data(name="report.docx", md5="abc123")
+        mock_drive.list_changes.return_value = (
+            [self._raw_change(file_id="f1", file_data=file_data)],
+            "token_2",
+        )
+        mock_drive.download_file.return_value = b"docx bytes"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+        mock_repo.push.side_effect = RuntimeError("push rejected")
+
+        with pytest.raises(RuntimeError, match="push rejected"):
+            run_sync(mock_drive, mock_state, mock_repo)
+
+        # File state must NOT be updated
+        mock_state.set_file.assert_not_called()
+        # Page token must NOT be advanced
+        mock_state.set_page_token.assert_not_called()
+
+    # -- 6. Multiple authors get separate commits ------------------------------
+
+    @patch("sync_engine.extract_text")
+    def test_multiple_authors_get_separate_commits(self, mock_extract, mock_drive, mock_state):
+        """Two changes from different authors produce two commits."""
+        from sync_engine import run_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.return_value = None  # both are new files
+
+        file_data_alice = _make_file_data(
+            name="alice.docx", md5="aaa",
+            author_name="Alice", author_email="alice@co.com",
+        )
+        file_data_bob = _make_file_data(
+            name="bob.docx", md5="bbb",
+            author_name="Bob", author_email="bob@co.com",
+        )
+
+        # Drive must return different paths for the two files
+        mock_drive.get_file_path.side_effect = ["alice.docx", "bob.docx"]
+        mock_drive.list_changes.return_value = (
+            [
+                self._raw_change(file_id="f_alice", file_data=file_data_alice),
+                self._raw_change(file_id="f_bob", file_data=file_data_bob),
+            ],
+            "token_2",
+        )
+        mock_drive.download_file.return_value = b"content"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 2
+        # Two separate commits — one per author
+        assert mock_repo.commit.call_count == 2
+        commit_authors = {c[0][1] for c in mock_repo.commit.call_args_list}
+        assert "Alice" in commit_authors
+        assert "Bob" in commit_authors
+        # unstage_all called once before re-staging per author
+        mock_repo.unstage_all.assert_called_once()
+        mock_repo.push.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _handle_rename with content change
+# ---------------------------------------------------------------------------
+
+
+class TestHandleRenameWithContentChange:
+    """Tests for _handle_rename when the file is also modified (lines 300-309).
+
+    After renaming the original and extracted files, _handle_rename checks
+    whether the content also changed and, if so, re-downloads and re-extracts.
+    """
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        """Side effect for extract_text that creates the output file."""
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("re-extracted content")
+        return True
+
+    @patch("sync_engine.extract_text")
+    def test_rename_with_md5_change_re_downloads(self, mock_extract, mock_state):
+        """File renamed AND md5 changed -> rename files AND re-download/extract."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        # Existing state with old md5
+        mock_state.get_file.return_value = {
+            "path": "old_report.docx",
+            "extracted_path": "old_report.docx.md",
+            "md5": "old_md5",
+        }
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"new docx content"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new_report.docx", md5="new_md5"),
+            old_path="old_report.docx",
+            new_path="new_report.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        # Original file was renamed
+        rename_calls = mock_repo.rename_file.call_args_list
+        assert call("docs/old_report.docx", "docs/new_report.docx") in rename_calls
+        # Extracted file was renamed
+        assert call("docs/old_report.docx.md", "docs/new_report.docx.md") in rename_calls
+
+        # Content changed (md5 differs) so re-download happened
+        mock_drive.download_file.assert_called_once_with("f1")
+        # extract_text called for the re-extraction
+        mock_extract.assert_called_once()
+        # Re-extracted file written to repo
+        assert mock_repo.write_file.call_count >= 1
+
+    @patch("sync_engine.extract_text")
+    def test_google_native_rename_always_re_extracts(self, mock_extract, mock_state):
+        """Google Doc renamed (no md5) -> always re-download since modifiedTime likely changed."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        # Existing state for a Google Doc (no md5)
+        mock_state.get_file.return_value = {
+            "path": "Old Title",
+            "extracted_path": "Old Title.docx.md",
+            "md5": None,
+        }
+
+        mock_drive = MagicMock()
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(
+                name="New Title",
+                mime_type="application/vnd.google-apps.document",
+                md5=None,
+                modified_time="2025-06-15T12:00:00Z",
+            ),
+            old_path="Old Title",
+            new_path="New Title",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        # Files were renamed
+        rename_calls = mock_repo.rename_file.call_args_list
+        assert call("docs/Old Title", "docs/New Title") in rename_calls
+        assert call("docs/Old Title.docx.md", "docs/New Title.docx.md") in rename_calls
+
+        # Google-native: no md5, so always re-extracts
+        mock_drive.export_file.assert_called_once_with(
+            "f1",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        mock_extract.assert_called_once()
+        # Re-exported file written to repo
+        assert mock_repo.write_file.call_count >= 1

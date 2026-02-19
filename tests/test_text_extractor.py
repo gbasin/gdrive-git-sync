@@ -538,3 +538,170 @@ class TestConstants:
         """All Google-native MIME types should start with the Google apps prefix."""
         for mime in GOOGLE_NATIVE_EXPORTS:
             assert mime.startswith("application/vnd.google-apps.")
+
+
+# ---------------------------------------------------------------------------
+# extract_pdf edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPdfEdgeCases:
+    """Edge cases for PDF extraction: encrypted files, mid-page errors."""
+
+    @patch("text_extractor.pdfplumber")
+    def test_encrypted_pdf_caught_gracefully(self, mock_plumber, tmp_path):
+        """Encrypted PDFs cause pdfplumber.open to raise; extract_text should
+        catch the exception and return False without crashing."""
+        mock_plumber.open.side_effect = Exception("file has not been decrypted")
+
+        output = tmp_path / "out.txt"
+        result = extract_text("encrypted.pdf", str(output))
+
+        assert result is False
+        assert not output.exists()
+
+    @patch("text_extractor.pdfplumber")
+    def test_pdf_page_extract_text_raises(self, mock_plumber):
+        """If page.extract_text() raises mid-page, extract_pdf should propagate
+        the exception (it is extract_text that catches it, not extract_pdf)."""
+        page = MagicMock()
+        page.extract_tables.return_value = []
+        page.extract_text.side_effect = RuntimeError("corrupt page data")
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        with pytest.raises(RuntimeError, match="corrupt page data"):
+            extract_pdf("broken.pdf")
+
+
+# ---------------------------------------------------------------------------
+# extract_docx edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDocxEdgeCases:
+    """Edge cases for DOCX extraction: corrupted files, empty content."""
+
+    @patch("text_extractor.postprocess")
+    @patch("text_extractor.pypandoc")
+    def test_corrupted_docx_caught_gracefully(self, mock_pypandoc, mock_postprocess, tmp_path):
+        """A corrupted DOCX that causes pypandoc to raise RuntimeError should
+        be caught by extract_text, returning False without crashing."""
+        mock_pypandoc.convert_file.side_effect = RuntimeError("Invalid docx file")
+
+        output = tmp_path / "out.md"
+        result = extract_text("bad.docx", str(output))
+
+        assert result is False
+        assert not output.exists()
+
+    @patch("text_extractor.postprocess")
+    @patch("text_extractor.pypandoc")
+    def test_empty_docx_returns_empty_string(self, mock_pypandoc, mock_postprocess, tmp_path):
+        """A DOCX with no content produces an empty output file and returns True."""
+        mock_pypandoc.convert_file.return_value = ""
+        mock_postprocess.return_value = ""
+
+        output = tmp_path / "out.md"
+        result = extract_text("empty.docx", str(output))
+
+        assert result is True
+        assert output.read_text(encoding="utf-8") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract_csv edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCsvEdgeCases:
+    """Edge cases for CSV extraction: encoding issues, wide tables, blank rows."""
+
+    def test_non_utf8_csv_caught_gracefully(self, tmp_path):
+        """A CSV encoded in Windows-1252 (not UTF-8) triggers a
+        UnicodeDecodeError which extract_text should catch, returning False."""
+        csv_file = tmp_path / "bad.csv"
+        # \xe9 is 'e-acute' in Windows-1252 but invalid as a standalone
+        # byte in UTF-8, so open(..., encoding="utf-8") will fail.
+        csv_file.write_bytes(b"Name,City\nJos\xe9,Montr\xe9al\n")
+
+        output = tmp_path / "out.txt"
+        result = extract_text(str(csv_file), str(output))
+
+        assert result is False
+        assert not output.exists()
+
+    def test_csv_with_many_columns(self, tmp_path):
+        """A CSV with 20+ columns should still produce a correctly
+        formatted markdown table with one pipe-delimited cell per column."""
+        headers = [f"Col{i}" for i in range(25)]
+        values = [f"val{i}" for i in range(25)]
+
+        csv_file = tmp_path / "wide.csv"
+        csv_file.write_text(
+            ",".join(headers) + "\n" + ",".join(values) + "\n",
+            encoding="utf-8",
+        )
+
+        result = extract_csv(str(csv_file))
+
+        lines = result.strip().split("\n")
+        assert len(lines) == 3  # header + separator + 1 data row
+
+        # Every line should have exactly 25 cells (26 pipes = 25 cells)
+        for line in lines:
+            pipes = line.count("|")
+            # Each row: "| c1 | c2 | ... | c25 |"  --> 26 pipes
+            assert pipes == 26, f"Expected 26 pipes, got {pipes}: {line!r}"
+
+        # Spot-check first and last column content
+        assert "Col0" in result
+        assert "Col24" in result
+        assert "val0" in result
+        assert "val24" in result
+
+    def test_csv_with_empty_rows(self, tmp_path):
+        """A CSV with blank lines between data rows should be handled
+        gracefully without crashing."""
+        csv_file = tmp_path / "gaps.csv"
+        csv_file.write_text(
+            "A,B\n\n1,2\n\n3,4\n",
+            encoding="utf-8",
+        )
+
+        result = extract_csv(str(csv_file))
+
+        # The CSV reader treats blank lines as rows with a single empty string,
+        # so the table should still contain our data.
+        assert "A" in result
+        assert "B" in result
+        assert "1" in result
+        assert "3" in result
+
+
+# ---------------------------------------------------------------------------
+# Special filenames
+# ---------------------------------------------------------------------------
+
+
+class TestSpecialFilenames:
+    """Verify get_extracted_filename handles unusual filenames correctly."""
+
+    def test_filename_with_spaces_and_parens(self):
+        result = get_extracted_filename("Q1 Report (Final).docx")
+        assert result == "Q1 Report (Final).docx.md"
+
+    def test_filename_with_unicode(self):
+        result = get_extracted_filename("R\u00e9sum\u00e9.pdf")
+        assert result == "R\u00e9sum\u00e9.pdf.txt"
+
+    def test_filename_with_dots(self):
+        result = get_extracted_filename("report.v2.final.docx")
+        assert result == "report.v2.final.docx.md"
+
+    def test_filename_with_leading_dot(self):
+        result = get_extracted_filename(".hidden.docx")
+        assert result == ".hidden.docx.md"

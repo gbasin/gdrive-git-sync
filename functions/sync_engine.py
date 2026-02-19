@@ -405,7 +405,19 @@ def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str):
             repo.stage_file(os.path.join(docs_subdir, change.new_path))
     else:
         if change.new_path:
-            repo.stage_file(os.path.join(docs_subdir, change.new_path))
+            # For Google-native files, _download_and_extract writes to
+            # name + export extension (e.g. "My Doc.docx"), not new_path
+            # ("My Doc").  Compute the actual path so we stage the right file.
+            mime_type = change.file_data.get("mimeType", "") if change.file_data else ""
+            if mime_type in NATIVE_EXPORTS:
+                _, ext, _ = NATIVE_EXPORTS[mime_type]
+                name = change.file_data.get("name", "")
+                exported_name = name + ext
+                dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
+                original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
+                repo.stage_file(os.path.join(docs_subdir, original_path))
+            else:
+                repo.stage_file(os.path.join(docs_subdir, change.new_path))
             # Also stage extracted file
             if change.file_data:
                 name = change.file_data.get("name", "")
