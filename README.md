@@ -150,7 +150,7 @@ At typical usage (a few files/day): **~$0.20/month** (Cloud Scheduler jobs). Eve
 ### Prerequisites
 
 - Python 3.12+
-- [uv](https://docs.astral.sh/uv/) (fast Python package manager)
+- [uv](https://docs.astral.sh/uv/)
 - Terraform (for infrastructure)
 
 ### Getting started
