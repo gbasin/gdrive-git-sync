@@ -14,6 +14,8 @@ venv/
 *.tfstate
 *.tfstate.backup
 *.tfplan
+*.tfvars
+*.tfvars.json
 .terraform.lock.hcl
 
 # Environment
