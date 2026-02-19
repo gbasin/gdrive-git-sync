@@ -15,14 +15,18 @@ TFVARS_FILE="$ROOT_DIR/infra/terraform.tfvars"
 
 # ── Flags ────────────────────────────────────────────────────────────
 AUTO=false
+DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --non-interactive|--auto|--ci) AUTO=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
     -h|--help)
-      echo "Usage: $0 [--non-interactive]"
+      echo "Usage: $0 [--non-interactive] [--dry-run]"
       echo ""
       echo "  --non-interactive  Agent/CI mode: no prompts, auto-installs prereqs,"
       echo "                     requires .env to exist, accepts GIT_TOKEN_VALUE env var."
+      echo "  --dry-run          Walk through the entire flow without executing anything."
+      echo "                     Uses placeholder values if .env doesn't exist."
       exit 0
       ;;
     *) echo "Unknown flag: $1 (try --help)"; exit 1 ;;
@@ -44,9 +48,26 @@ phase() {
   printf "${BOLD}[$1] $2${NC}\n"
 }
 
+# Run a command, or return simulated output in dry-run mode.
+# Usage: result=$(sim "simulated output" command arg1 arg2)
+sim() {
+  local sim_output="$1"; shift
+  if $DRY_RUN; then
+    echo "$sim_output"
+    return 0
+  fi
+  "$@"
+}
+
 # Spinner — runs a command in the background, shows elapsed time.
+# In dry-run mode, prints what would happen without executing.
 spin() {
   local msg="$1"; shift
+  if $DRY_RUN; then
+    printf "  ${GREEN}✔${NC} %s ${DIM}[dry-run: %s]${NC}\n" "$msg" "$*"
+    return 0
+  fi
+
   local logfile; logfile=$(mktemp)
   local rc=0 s=0
 
@@ -91,6 +112,7 @@ echo ""
 echo -e "${BOLD}  🔄  gdrive-git-sync setup${NC}"
 echo -e "  ${DIM}Automatically version-control Drive files in git${NC}"
 $AUTO && echo -e "  ${DIM}Running in non-interactive mode${NC}"
+$DRY_RUN && echo -e "  ${YELLOW}${BOLD}DRY RUN${NC} ${DIM}— nothing will be created or modified${NC}"
 echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -269,6 +291,15 @@ if [ -f "$ENV_FILE" ]; then
   set +a
   hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
   hint "To change settings, edit .env and re-run."
+elif $DRY_RUN && [ ! -f "$ENV_FILE" ]; then
+  ok "Using placeholder values [dry-run]"
+  GCP_PROJECT="my-project-12345"
+  DRIVE_FOLDER_ID="1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+  GIT_REPO_URL="https://github.com/yourname/drive-sync.git"
+  GIT_BRANCH="main"
+  GIT_TOKEN_SECRET="git-token"
+  GIT_TOKEN_VALUE="ghp_xxxxxxxxxxxxxxxxxxxx"
+  hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
 elif $AUTO; then
   fail ".env not found. In non-interactive mode, .env must exist."
   hint "Create it from the example:  cp .env.example .env"
@@ -306,7 +337,7 @@ else
 
     # ── Auth (both gcloud + ADC together) ──
     echo ""
-    CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+    CURRENT_ACCOUNT=$(sim "dryrun@example.com" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
     if [ -n "$CURRENT_ACCOUNT" ]; then
       ok "Already logged in as $CURRENT_ACCOUNT"
     else
@@ -315,11 +346,11 @@ else
       hint "2) Authorize Terraform (the tool that sets up your infrastructure)"
       echo ""
       read -rp "  Press Enter to open the browser..."
-      gcloud auth login
+      if ! $DRY_RUN; then gcloud auth login; fi
       ok "Logged in to gcloud"
     fi
     ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
-    if [ ! -f "$ADC_FILE" ]; then
+    if [ ! -f "$ADC_FILE" ] && ! $DRY_RUN; then
       info "One more sign-in — this one is for Terraform..."
       gcloud auth application-default login
       ok "Terraform credentials saved"
@@ -327,7 +358,7 @@ else
     FULL_AUTH_DONE=true
 
     # ── Check billing ──
-    BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+    BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
 
     if [ -z "$BILLING_ACCOUNTS" ]; then
       echo ""
@@ -344,7 +375,7 @@ else
       read -rp "  Press Enter when you've created a billing account..."
 
       # Re-check
-      BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+      BILLING_ACCOUNTS=$(sim "012345-6789AB-CDEF01	My Billing Account" gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
       if [ -z "$BILLING_ACCOUNTS" ]; then
         fail "Still no billing account found."
         hint "Go to https://console.cloud.google.com/billing/create and try again,"
@@ -367,13 +398,20 @@ else
     done
 
     # Idempotent — skip if project already exists (e.g. re-run after partial failure)
-    if gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
+    PROJECT_EXISTS=false
+    if $DRY_RUN; then
+      PROJECT_EXISTS=false  # simulate creation path in dry-run
+    elif gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
+      PROJECT_EXISTS=true
+    fi
+
+    if $PROJECT_EXISTS; then
       ok "Project $GCP_PROJECT already exists"
     else
       spin "Creating project $GCP_PROJECT" \
         gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
     fi
-    gcloud config set project "$GCP_PROJECT" 2>/dev/null
+    if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
 
     # ── Link billing ──
     ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
@@ -445,8 +483,8 @@ else
   else
     # Check if gh CLI is available
     if command -v gh &>/dev/null; then
-      GH_USER=$(gh api user --jq .login 2>/dev/null || true)
-      if [ -z "$GH_USER" ]; then
+      GH_USER=$(sim "dryrunuser" gh api user --jq .login 2>/dev/null || true)
+      if [ -z "$GH_USER" ] && ! $DRY_RUN; then
         info "GitHub CLI is installed but not logged in. Let's fix that."
         gh auth login
         GH_USER=$(gh api user --jq .login 2>/dev/null || true)
@@ -608,10 +646,12 @@ fi
 phase "3/4" "Setting up GCP"
 
 # ── Auth ──
-CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+CURRENT_ACCOUNT=$(sim "dryrun@example.com" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
 ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
 
-if $AUTO; then
+if $DRY_RUN; then
+  ok "Authenticated as dryrun@example.com [dry-run]"
+elif $AUTO; then
   if [ -n "$CURRENT_ACCOUNT" ]; then
     ok "Authenticated as $CURRENT_ACCOUNT"
   elif [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
@@ -649,7 +689,7 @@ else
   fi
 fi
 
-gcloud config set project "$GCP_PROJECT" 2>/dev/null
+if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
 ok "Active project: $GCP_PROJECT"
 
 # ── APIs ──
@@ -666,7 +706,14 @@ spin "Enabling GCP APIs" \
 
 # ── Source bucket ──
 BUCKET="${GCP_PROJECT}-functions-source"
-if gcloud storage buckets describe "gs://$BUCKET" &>/dev/null 2>&1; then
+BUCKET_EXISTS=false
+if $DRY_RUN; then
+  BUCKET_EXISTS=true
+elif gcloud storage buckets describe "gs://$BUCKET" &>/dev/null 2>&1; then
+  BUCKET_EXISTS=true
+fi
+
+if $BUCKET_EXISTS; then
   ok "Source bucket: gs://$BUCKET"
 else
   spin "Creating source bucket" \
@@ -689,9 +736,16 @@ store_token() {
   rm -f "$tmpfile"
 }
 
-HAS_VERSION=$(gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null || true)
+HAS_VERSION=$(sim "" gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null || true)
 
-if [ -n "$GIT_TOKEN_VALUE" ]; then
+if $DRY_RUN; then
+  if [ -n "$GIT_TOKEN_VALUE" ]; then
+    ok "Would store git token in Secret Manager [dry-run]"
+    GIT_TOKEN_VALUE=""
+  else
+    ok "Would check/store git token [dry-run]"
+  fi
+elif [ -n "$GIT_TOKEN_VALUE" ]; then
   store_token "$GIT_TOKEN_VALUE"
   GIT_TOKEN_VALUE=""
 elif [ -n "$HAS_VERSION" ]; then
@@ -721,9 +775,9 @@ fi
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 phase "4/4" "Almost there — three manual steps remain"
 
-SYNC_URL=$(terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url 2>/dev/null || echo "<run make deploy first>")
-SETUP_URL=$(terraform -chdir="$ROOT_DIR/infra" output -raw setup_watch_url 2>/dev/null || echo "<run make deploy first>")
-SA_EMAIL=$(terraform -chdir="$ROOT_DIR/infra" output -raw service_account_email 2>/dev/null || echo "<run make deploy first>")
+SYNC_URL=$(sim "https://drive-sync-handler-abc123-uc.a.run.app" terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url 2>/dev/null || echo "<run make deploy first>")
+SETUP_URL=$(sim "https://drive-sync-setup-abc123-uc.a.run.app/setup-watch" terraform -chdir="$ROOT_DIR/infra" output -raw setup_watch_url 2>/dev/null || echo "<run make deploy first>")
+SA_EMAIL=$(sim "drive-sync@my-project-12345.iam.gserviceaccount.com" terraform -chdir="$ROOT_DIR/infra" output -raw service_account_email 2>/dev/null || echo "<run make deploy first>")
 # Extract just the domain from the sync URL for step 1
 SYNC_DOMAIN=$(echo "$SYNC_URL" | sed -n 's|https://\([^/]*\).*|\1|p')
 
@@ -733,7 +787,7 @@ echo ""
 hint "Drive won't send notifications to your webhook unless you prove you"
 hint "own the URL. This is a one-time process with two parts:"
 echo ""
-hint "${BOLD}Part A — Prove you own the URL:${NC}"
+echo -e "    ${BOLD}Part A — Prove you own the URL:${NC}"
 hint "  1. Open: https://search.google.com/search-console"
 hint "     (\"Search Console\" is a Google tool for verifying website ownership)"
 hint "  2. Click \"Add property\" (or the dropdown at top-left → \"Add property\")"
@@ -743,7 +797,7 @@ hint "  5. Expand the \"HTML file\" verification method"
 hint "     Your Cloud Function already serves this file automatically —"
 hint "     just click \"Verify.\" It should turn green."
 echo ""
-hint "${BOLD}Part B — Register the domain with GCP:${NC}"
+echo -e "    ${BOLD}Part B — Register the domain with GCP:${NC}"
 hint "  1. Open: https://console.cloud.google.com/apis/credentials/domainverification"
 hint "     (GCP Console → APIs & Services → Domain Verification)"
 hint "  2. Click \"Add domain\""
