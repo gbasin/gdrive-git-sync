@@ -94,6 +94,19 @@ class StateManager:
         if doc.exists and doc.to_dict().get("owner") == self.lock_owner:
             lock_ref.set({"locked": False, "owner": None, "acquired_at": None})
 
+    # --- Resync flag ---
+
+    def set_resync_needed(self):
+        """Flag that a webhook arrived while sync was in progress."""
+        self._config_ref("resync_needed").set({"needed": True})
+
+    def clear_resync_needed(self):
+        self._config_ref("resync_needed").delete()
+
+    def is_resync_needed(self) -> bool:
+        doc = self._config_ref("resync_needed").get()
+        return doc.exists and doc.to_dict().get("needed", False)
+
     # --- File tracking (subcollection) ---
 
     def _file_ref(self, file_id: str):

@@ -64,16 +64,15 @@ def sync_handler(request: Request):
 
         # Try to acquire lock
         if not state.acquire_lock():
-            logger.info("Another sync is in progress, skipping")
+            # Flag that changes arrived while sync was running.
+            # The active sync will check this flag and re-run before exiting.
+            state.set_resync_needed()
+            logger.info("Another sync is in progress, flagged for resync")
             return "OK", 200
 
-        repo = GitRepo()
         try:
-            drive = DriveClient()
-            count = run_sync(drive, state, repo)
-            logger.info(f"Sync completed: {count} changes")
+            _run_sync_loop(state)
         finally:
-            repo.cleanup()
             state.release_lock()
 
     except Exception:
@@ -81,6 +80,28 @@ def sync_handler(request: Request):
 
     # Always return 200
     return "OK", 200
+
+
+def _run_sync_loop(state: StateManager, max_iterations: int = 3):
+    """Run sync, then re-run if more webhooks arrived during processing.
+
+    Caps iterations to prevent unbounded looping from continuous edits.
+    After max_iterations, any remaining changes wait for the next webhook
+    or the 4-hour safety-net.
+    """
+    for i in range(max_iterations):
+        state.clear_resync_needed()
+        repo = GitRepo()
+        try:
+            drive = DriveClient()
+            count = run_sync(drive, state, repo)
+            logger.info(f"Sync iteration {i + 1}: {count} changes")
+        finally:
+            repo.cleanup()
+
+        if not state.is_resync_needed():
+            break
+        logger.info("Resync flag set, running again...")
 
 
 @functions_framework.http

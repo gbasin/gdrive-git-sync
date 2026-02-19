@@ -552,3 +552,173 @@ class TestExcludePatterns:
         result = classify_change("fileId1", raw, mock_drive, mock_state)
         assert result is not None
         assert result.change_type == ChangeType.ADD
+
+
+# ---------------------------------------------------------------------------
+# Multi-author staging flow
+# ---------------------------------------------------------------------------
+
+
+class TestMultiAuthorCommit:
+    """Tests that multi-author changes produce separate commits with correct staging."""
+
+    def test_single_author_does_not_unstage(self):
+        """When all changes are from one author, we skip unstage/restage."""
+        from sync_engine import Change, ChangeType, group_by_author
+        from config import get_config
+
+        cfg = get_config()
+        changes = [
+            Change(file_id="f1", change_type=ChangeType.ADD, new_path="a.docx",
+                   file_data={"name": "a.docx"}, author_name="Alice", author_email="alice@co.com"),
+            Change(file_id="f2", change_type=ChangeType.ADD, new_path="b.docx",
+                   file_data={"name": "b.docx"}, author_name="Alice", author_email="alice@co.com"),
+        ]
+        groups = group_by_author(changes, cfg)
+        assert len(groups) == 1
+        assert len(groups[0].files) == 2
+
+    def test_multiple_authors_produce_separate_groups(self):
+        """When changes come from multiple authors, each gets a separate group."""
+        from sync_engine import Change, ChangeType, group_by_author
+        from config import get_config
+
+        cfg = get_config()
+        changes = [
+            Change(file_id="f1", change_type=ChangeType.ADD, new_path="a.docx",
+                   file_data={"name": "a.docx"}, author_name="Alice", author_email="alice@co.com"),
+            Change(file_id="f2", change_type=ChangeType.MODIFY, new_path="b.docx",
+                   file_data={"name": "b.docx"}, author_name="Bob", author_email="bob@co.com"),
+            Change(file_id="f3", change_type=ChangeType.ADD, new_path="c.docx",
+                   file_data={"name": "c.docx"}, author_name="Alice", author_email="alice@co.com"),
+        ]
+        groups = group_by_author(changes, cfg)
+        assert len(groups) == 2
+
+        alice = [g for g in groups if g.author_name == "Alice"][0]
+        bob = [g for g in groups if g.author_name == "Bob"][0]
+        assert len(alice.files) == 2
+        assert len(bob.files) == 1
+
+    def test_stage_change_files_stages_original_and_extracted(self):
+        """_stage_change_files stages both the original and extracted file."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1", change_type=ChangeType.ADD, new_path="Reports/doc.docx",
+            file_data={"name": "doc.docx", "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [call[0][0] for call in mock_repo.stage_file.call_args_list]
+        assert "docs/Reports/doc.docx" in stage_calls
+        assert "docs/Reports/doc.docx.md" in stage_calls
+
+    def test_stage_change_files_delete_stages_old_path(self):
+        """_stage_change_files for DELETE stages the old path."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/old.docx")
+        _stage_change_files(change, mock_repo, "docs")
+
+        mock_repo.stage_file.assert_called_once_with("docs/Reports/old.docx")
+
+
+# ---------------------------------------------------------------------------
+# Resync loop (rapid changes regression)
+# ---------------------------------------------------------------------------
+
+
+class TestResyncLoop:
+    """Regression tests for rapid save scenarios.
+
+    When webhooks arrive while a sync is in progress, the resync flag
+    ensures changes are picked up without waiting for the 4-hour safety-net.
+    """
+
+    def test_resync_flag_triggers_second_sync(self):
+        """If resync_needed is set during sync, _run_sync_loop runs again."""
+        from main import _run_sync_loop
+
+        mock_state = MagicMock()
+        # First call: resync needed. Second call: no resync needed.
+        mock_state.is_resync_needed.side_effect = [True, False]
+        mock_state.clear_resync_needed.return_value = None
+
+        with patch("main.GitRepo") as MockRepo, \
+             patch("main.DriveClient") as MockDrive, \
+             patch("main.run_sync", return_value=1) as mock_sync:
+            MockRepo.return_value.cleanup.return_value = None
+            _run_sync_loop(mock_state)
+
+            # run_sync called twice (initial + resync)
+            assert mock_sync.call_count == 2
+
+    def test_resync_loop_caps_at_max_iterations(self):
+        """Continuous edits don't cause unbounded looping."""
+        from main import _run_sync_loop
+
+        mock_state = MagicMock()
+        # Always says resync needed
+        mock_state.is_resync_needed.return_value = True
+        mock_state.clear_resync_needed.return_value = None
+
+        with patch("main.GitRepo") as MockRepo, \
+             patch("main.DriveClient"), \
+             patch("main.run_sync", return_value=1) as mock_sync:
+            MockRepo.return_value.cleanup.return_value = None
+            _run_sync_loop(mock_state, max_iterations=3)
+
+            # Capped at 3 even though resync was always True
+            assert mock_sync.call_count == 3
+
+    def test_no_resync_flag_means_single_run(self):
+        """Normal case: no concurrent webhooks, sync runs once."""
+        from main import _run_sync_loop
+
+        mock_state = MagicMock()
+        mock_state.is_resync_needed.return_value = False
+        mock_state.clear_resync_needed.return_value = None
+
+        with patch("main.GitRepo") as MockRepo, \
+             patch("main.DriveClient"), \
+             patch("main.run_sync", return_value=0) as mock_sync:
+            MockRepo.return_value.cleanup.return_value = None
+            _run_sync_loop(mock_state)
+
+            assert mock_sync.call_count == 1
+
+    def test_dedup_keeps_latest_change_per_file(self):
+        """When the same file is modified multiple times, only latest state is synced."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_drive = MagicMock()
+        mock_drive.is_in_folder.return_value = True
+        mock_drive.get_file_path.return_value = "doc.docx"
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+
+        mock_state = MagicMock()
+        mock_state.get_file.return_value = {
+            "name": "doc.docx", "path": "doc.docx", "md5": "old_md5"
+        }
+
+        # Simulate 3 rapid saves — changes.list returns all 3
+        raw_changes = [
+            {"fileId": "f1", "file": _make_file_data(md5="md5_v1")},
+            {"fileId": "f1", "file": _make_file_data(md5="md5_v2")},
+            {"fileId": "f1", "file": _make_file_data(md5="md5_v3")},
+        ]
+
+        # Dedup keeps last entry
+        deduped = {}
+        for change in raw_changes:
+            deduped[change["fileId"]] = change
+        assert len(deduped) == 1
+        assert deduped["f1"]["file"]["md5Checksum"] == "md5_v3"
+
+        # Classify the deduped change
+        result = classify_change("f1", deduped["f1"], mock_drive, mock_state)
+        assert result.change_type == ChangeType.MODIFY
