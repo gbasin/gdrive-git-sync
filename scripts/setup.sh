@@ -489,14 +489,20 @@ else
         read -rp "  Repo name [$SUGGESTED_REPO]: " REPO_NAME
         REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
 
-        read -rp "  Private repo? [Y/n]: " REPO_PRIVATE
-        PRIVATE_FLAG="--private"
-        [[ "${REPO_PRIVATE:-Y}" =~ ^[Nn] ]] && PRIVATE_FLAG="--public"
+        # Idempotent — skip if repo already exists (e.g. re-run after crash)
+        if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null 2>&1; then
+          GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+          ok "Repo $GH_USER/$REPO_NAME already exists"
+        else
+          read -rp "  Private repo? [Y/n]: " REPO_PRIVATE
+          PRIVATE_FLAG="--private"
+          [[ "${REPO_PRIVATE:-Y}" =~ ^[Nn] ]] && PRIVATE_FLAG="--public"
 
-        spin "Creating GitHub repo $GH_USER/$REPO_NAME" \
-          gh repo create "$REPO_NAME" $PRIVATE_FLAG --clone=false --description "Drive files version-controlled in git"
-        GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
-        ok "Created $GIT_REPO_URL"
+          spin "Creating GitHub repo $GH_USER/$REPO_NAME" \
+            gh repo create "$REPO_NAME" $PRIVATE_FLAG --clone=false --description "Drive files version-controlled in git"
+          GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+          ok "Created $GIT_REPO_URL"
+        fi
       else
         fail "Couldn't detect GitHub user. Let's enter the repo URL manually."
         hint "Create a repo at https://github.com/new, then paste the HTTPS URL."
@@ -690,16 +696,27 @@ fi
 ok "Active project: $GCP_PROJECT"
 
 # ── APIs ──
-spin "Enabling GCP APIs" \
-  gcloud services enable \
-    cloudfunctions.googleapis.com \
-    cloudscheduler.googleapis.com \
-    firestore.googleapis.com \
-    secretmanager.googleapis.com \
-    drive.googleapis.com \
-    cloudbuild.googleapis.com \
-    run.googleapis.com \
-    artifactregistry.googleapis.com
+# Check if a key API is already enabled to skip the slow enable-all call
+APIS_NEEDED=true
+if ! $DRY_RUN; then
+  if gcloud services list --enabled --filter="name:cloudfunctions.googleapis.com" --format="value(name)" 2>/dev/null | grep -q cloudfunctions; then
+    APIS_NEEDED=false
+    ok "GCP APIs already enabled"
+  fi
+fi
+
+if $APIS_NEEDED; then
+  spin "Enabling GCP APIs" \
+    gcloud services enable \
+      cloudfunctions.googleapis.com \
+      cloudscheduler.googleapis.com \
+      firestore.googleapis.com \
+      secretmanager.googleapis.com \
+      drive.googleapis.com \
+      cloudbuild.googleapis.com \
+      run.googleapis.com \
+      artifactregistry.googleapis.com
+fi
 
 # ── Source bucket ──
 BUCKET="${GCP_PROJECT}-functions-source"
@@ -718,8 +735,21 @@ else
 fi
 
 # ── Deploy ──
-spin "Deploying infrastructure (this one takes a while)" \
-  "$SCRIPT_DIR/deploy.sh"
+# Skip if terraform state already has the sync handler (previous deploy succeeded).
+# deploy.sh is idempotent via terraform, but it's slow — no need to re-run if nothing changed.
+DEPLOY_NEEDED=true
+if ! $DRY_RUN && [ -f "$ROOT_DIR/infra/terraform.tfstate" ]; then
+  if terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url &>/dev/null 2>&1; then
+    DEPLOY_NEEDED=false
+    ok "Infrastructure already deployed"
+    hint "To force redeploy: make deploy"
+  fi
+fi
+
+if $DEPLOY_NEEDED; then
+  spin "Deploying infrastructure (this one takes a while)" \
+    "$SCRIPT_DIR/deploy.sh"
+fi
 
 # ── Git token ──
 SECRET_NAME="${GIT_TOKEN_SECRET:-git-token}"
