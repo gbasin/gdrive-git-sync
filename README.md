@@ -2,12 +2,22 @@
 
 Automatically version-control files from Google Drive in a git repository with meaningful content diffs.
 
-Lawyers (or anyone) drop `.docx`/`.pdf` files in a Drive folder → files appear in git with extracted text alongside the originals → `git diff` shows actual content changes, not binary blobs.
+Files dropped in a Drive folder appear in git with extracted text alongside the originals. `git diff` shows actual content changes, not binary blobs. Commits are attributed to the person who edited the file in Drive.
+
+## Use cases
+
+- **Legal teams** — Track changes to contracts and NDAs with full redline history. `git blame` shows who changed what.
+- **Compliance & regulatory** — Immutable audit trail for policy documents. Every version is hashed and timestamped.
+- **Consulting / client deliverables** — Version-control proposals and reports that clients edit in Drive.
+- **Research & academia** — Track revisions to papers and grant applications across collaborators.
+- **Finance & accounting** — Diff quarterly reports, invoices, and spreadsheets to catch changes between versions.
+- **HR & operations** — Version employee handbooks, SOPs, and training materials edited by non-technical staff.
+- **Any team using Drive** — Get git-grade version history for people who will never touch a terminal.
 
 ## How it works
 
 ```
-File dropped in Drive folder
+File added/edited in Drive folder
         ↓
 Drive push notification (webhook)
         ↓
@@ -28,9 +38,9 @@ docs/
 ├── Contracts/
 │   ├── Contract_v2.docx              # original binary
 │   └── Contract_v2.docx.md           # pandoc-extracted markdown (diffable)
-├── NDAs/
-│   ├── NDA_Final.pdf                 # original binary
-│   └── NDA_Final.pdf.txt             # pdfplumber-extracted text (diffable)
+├── Reports/
+│   ├── Q4_Report.pdf                 # original binary
+│   └── Q4_Report.pdf.txt             # pdfplumber-extracted text (diffable)
 ```
 
 - `git diff` on `.md`/`.txt` files shows meaningful content changes
@@ -126,13 +136,14 @@ curl -X POST "$(terraform -chdir=infra output -raw setup_watch_url)?initial_sync
 ## Reliability
 
 - **Webhook + polling**: Drive push notifications for speed (~30s), safety-net poll every 4 hours for reliability
+- **Resync on contention**: If a webhook arrives during an active sync, it flags a re-run instead of silently dropping
 - **Watch renewal**: Automatic every 6 days (channels expire after 7)
 - **Concurrency**: Triple protection (max_instances=1, max_concurrency=1, Firestore distributed lock with 10-min TTL)
 - **Deduplication**: md5 checksums prevent redundant commits
 
 ## Cost
 
-At typical law firm volume (a few files/day): **~$0.20/month** (Cloud Scheduler jobs). Everything else falls within GCP free tiers.
+At typical usage (a few files/day): **~$0.20/month** (Cloud Scheduler jobs). Everything else falls within GCP free tiers.
 
 ## Running tests
 
