@@ -3,13 +3,11 @@
 DriveClient, StateManager, and GitRepo are mocked throughout.
 """
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from config import reset_config
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -295,8 +293,8 @@ class TestGroupByAuthor:
     """Tests for grouping changes by author for separate commits."""
 
     def test_groups_by_author(self):
-        from sync_engine import AuthorCommit, Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
 
@@ -336,8 +334,8 @@ class TestGroupByAuthor:
         assert "add: a.docx" in alice_group.message
 
     def test_fallback_to_config_author(self):
-        from sync_engine import Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
 
@@ -358,8 +356,8 @@ class TestGroupByAuthor:
         assert groups[0].author_email == "bot@test.com"
 
     def test_message_includes_all_changes(self):
-        from sync_engine import Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
 
@@ -386,8 +384,8 @@ class TestGroupByAuthor:
         assert "delete: old.docx" in msg
 
     def test_delete_uses_old_path_in_message(self):
-        from sync_engine import Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
 
@@ -564,15 +562,27 @@ class TestMultiAuthorCommit:
 
     def test_single_author_does_not_unstage(self):
         """When all changes are from one author, we skip unstage/restage."""
-        from sync_engine import Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
         changes = [
-            Change(file_id="f1", change_type=ChangeType.ADD, new_path="a.docx",
-                   file_data={"name": "a.docx"}, author_name="Alice", author_email="alice@co.com"),
-            Change(file_id="f2", change_type=ChangeType.ADD, new_path="b.docx",
-                   file_data={"name": "b.docx"}, author_name="Alice", author_email="alice@co.com"),
+            Change(
+                file_id="f1",
+                change_type=ChangeType.ADD,
+                new_path="a.docx",
+                file_data={"name": "a.docx"},
+                author_name="Alice",
+                author_email="alice@co.com",
+            ),
+            Change(
+                file_id="f2",
+                change_type=ChangeType.ADD,
+                new_path="b.docx",
+                file_data={"name": "b.docx"},
+                author_name="Alice",
+                author_email="alice@co.com",
+            ),
         ]
         groups = group_by_author(changes, cfg)
         assert len(groups) == 1
@@ -580,17 +590,35 @@ class TestMultiAuthorCommit:
 
     def test_multiple_authors_produce_separate_groups(self):
         """When changes come from multiple authors, each gets a separate group."""
-        from sync_engine import Change, ChangeType, group_by_author
         from config import get_config
+        from sync_engine import Change, ChangeType, group_by_author
 
         cfg = get_config()
         changes = [
-            Change(file_id="f1", change_type=ChangeType.ADD, new_path="a.docx",
-                   file_data={"name": "a.docx"}, author_name="Alice", author_email="alice@co.com"),
-            Change(file_id="f2", change_type=ChangeType.MODIFY, new_path="b.docx",
-                   file_data={"name": "b.docx"}, author_name="Bob", author_email="bob@co.com"),
-            Change(file_id="f3", change_type=ChangeType.ADD, new_path="c.docx",
-                   file_data={"name": "c.docx"}, author_name="Alice", author_email="alice@co.com"),
+            Change(
+                file_id="f1",
+                change_type=ChangeType.ADD,
+                new_path="a.docx",
+                file_data={"name": "a.docx"},
+                author_name="Alice",
+                author_email="alice@co.com",
+            ),
+            Change(
+                file_id="f2",
+                change_type=ChangeType.MODIFY,
+                new_path="b.docx",
+                file_data={"name": "b.docx"},
+                author_name="Bob",
+                author_email="bob@co.com",
+            ),
+            Change(
+                file_id="f3",
+                change_type=ChangeType.ADD,
+                new_path="c.docx",
+                file_data={"name": "c.docx"},
+                author_name="Alice",
+                author_email="alice@co.com",
+            ),
         ]
         groups = group_by_author(changes, cfg)
         assert len(groups) == 2
@@ -606,8 +634,13 @@ class TestMultiAuthorCommit:
 
         mock_repo = MagicMock()
         change = Change(
-            file_id="f1", change_type=ChangeType.ADD, new_path="Reports/doc.docx",
-            file_data={"name": "doc.docx", "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Reports/doc.docx",
+            file_data={
+                "name": "doc.docx",
+                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            },
         )
         _stage_change_files(change, mock_repo, "docs")
 
@@ -647,9 +680,11 @@ class TestResyncLoop:
         mock_state.is_resync_needed.side_effect = [True, False]
         mock_state.clear_resync_needed.return_value = None
 
-        with patch("main.GitRepo") as MockRepo, \
-             patch("main.DriveClient") as MockDrive, \
-             patch("main.run_sync", return_value=1) as mock_sync:
+        with (
+            patch("main.GitRepo") as MockRepo,
+            patch("main.DriveClient"),
+            patch("main.run_sync", return_value=1) as mock_sync,
+        ):
             MockRepo.return_value.cleanup.return_value = None
             _run_sync_loop(mock_state)
 
@@ -665,9 +700,11 @@ class TestResyncLoop:
         mock_state.is_resync_needed.return_value = True
         mock_state.clear_resync_needed.return_value = None
 
-        with patch("main.GitRepo") as MockRepo, \
-             patch("main.DriveClient"), \
-             patch("main.run_sync", return_value=1) as mock_sync:
+        with (
+            patch("main.GitRepo") as MockRepo,
+            patch("main.DriveClient"),
+            patch("main.run_sync", return_value=1) as mock_sync,
+        ):
             MockRepo.return_value.cleanup.return_value = None
             _run_sync_loop(mock_state, max_iterations=3)
 
@@ -682,9 +719,11 @@ class TestResyncLoop:
         mock_state.is_resync_needed.return_value = False
         mock_state.clear_resync_needed.return_value = None
 
-        with patch("main.GitRepo") as MockRepo, \
-             patch("main.DriveClient"), \
-             patch("main.run_sync", return_value=0) as mock_sync:
+        with (
+            patch("main.GitRepo") as MockRepo,
+            patch("main.DriveClient"),
+            patch("main.run_sync", return_value=0) as mock_sync,
+        ):
             MockRepo.return_value.cleanup.return_value = None
             _run_sync_loop(mock_state)
 
@@ -701,9 +740,7 @@ class TestResyncLoop:
         mock_drive.should_skip_file.return_value = None
 
         mock_state = MagicMock()
-        mock_state.get_file.return_value = {
-            "name": "doc.docx", "path": "doc.docx", "md5": "old_md5"
-        }
+        mock_state.get_file.return_value = {"name": "doc.docx", "path": "doc.docx", "md5": "old_md5"}
 
         # Simulate 3 rapid saves — changes.list returns all 3
         raw_changes = [

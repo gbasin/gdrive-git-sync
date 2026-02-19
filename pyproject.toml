@@ -1,0 +1,77 @@
+[project]
+name = "gdrive-git-sync"
+version = "0.1.0"
+description = "Automatically version-control Google Drive files in git with meaningful content diffs"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "functions-framework>=3",
+    "google-api-python-client>=2",
+    "google-auth>=2",
+    "google-cloud-firestore>=2",
+    "google-cloud-secret-manager>=2",
+    "gitpython>=3",
+    "pypandoc-binary>=1",
+    "pdfplumber>=0.10",
+    "markdownify>=0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pre-commit>=4",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["functions", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "PIE",   # flake8-pie
+    "RET",   # flake8-return
+    "LOG",   # flake8-logging
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "RET504", # unnecessary assignment before return
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "drive_client", "git_ops", "state_manager", "sync_engine", "text_extractor", "pandoc_postprocess"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "functions"
+files = ["functions"]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=functions --cov-report=term-missing --cov-fail-under=60"
+
+[tool.coverage.run]
+source = ["functions"]
+omit = ["functions/main.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__",
+    "if TYPE_CHECKING",
+]

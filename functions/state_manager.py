@@ -48,11 +48,13 @@ class StateManager:
         return doc.to_dict() if doc.exists else None
 
     def set_watch_channel(self, channel_id: str, resource_id: str, expiration: int):
-        self._config_ref("watch_channel").set({
-            "channel_id": channel_id,
-            "resource_id": resource_id,
-            "expiration": expiration,
-        })
+        self._config_ref("watch_channel").set(
+            {
+                "channel_id": channel_id,
+                "resource_id": resource_id,
+                "expiration": expiration,
+            }
+        )
 
     def clear_watch_channel(self):
         self._config_ref("watch_channel").delete()
@@ -73,15 +75,17 @@ class StateManager:
                     if time.time() - acquired_at < LOCK_TTL_SECONDS:
                         return False  # Lock held and not stale
                     logger.warning(
-                        f"Breaking stale lock from {data.get('owner')} "
-                        f"(acquired {time.time() - acquired_at:.0f}s ago)"
+                        f"Breaking stale lock from {data.get('owner')} (acquired {time.time() - acquired_at:.0f}s ago)"
                     )
 
-            transaction.set(lock_ref, {
-                "locked": True,
-                "owner": self.lock_owner,
-                "acquired_at": time.time(),
-            })
+            transaction.set(
+                lock_ref,
+                {
+                    "locked": True,
+                    "owner": self.lock_owner,
+                    "acquired_at": time.time(),
+                },
+            )
             return True
 
         transaction = self.db.transaction()
@@ -130,7 +134,4 @@ class StateManager:
     def get_files_in_folder(self, folder_path: str) -> dict[str, dict]:
         """Return all tracked files whose path starts with folder_path."""
         all_files = self.get_all_files()
-        return {
-            fid: data for fid, data in all_files.items()
-            if data.get("path", "").startswith(folder_path)
-        }
+        return {fid: data for fid, data in all_files.items() if data.get("path", "").startswith(folder_path)}

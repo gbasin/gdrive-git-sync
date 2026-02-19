@@ -13,7 +13,6 @@ import os
 import functions_framework
 from flask import Request
 
-from config import get_config
 from drive_client import DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
@@ -37,9 +36,7 @@ def sync_handler(request: Request):
     # GET: serve domain verification file
     if request.method == "GET":
         if VERIFICATION_TOKEN:
-            return f"google-site-verification: {VERIFICATION_TOKEN}", 200, {
-                "Content-Type": "text/html"
-            }
+            return f"google-site-verification: {VERIFICATION_TOKEN}", 200, {"Content-Type": "text/html"}
         return "OK", 200
 
     # POST: handle Drive notification
@@ -174,9 +171,7 @@ def setup_watch(request: Request):
     # GET: serve verification
     if request.method == "GET":
         if VERIFICATION_TOKEN:
-            return f"google-site-verification: {VERIFICATION_TOKEN}", 200, {
-                "Content-Type": "text/html"
-            }
+            return f"google-site-verification: {VERIFICATION_TOKEN}", 200, {"Content-Type": "text/html"}
         return "Setup endpoint. POST to initialize.", 200
 
     try:

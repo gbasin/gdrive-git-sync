@@ -1,16 +1,15 @@
 """Google Drive API wrapper for change detection, downloads, and watch channels."""
 
 import fnmatch
+import io
 import logging
 import uuid
 
 import google.auth
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import io
 
 from config import get_config
-from text_extractor import GOOGLE_NATIVE_EXPORTS
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +27,7 @@ class DriveClient:
     def __init__(self, service=None):
         self.cfg = get_config()
         if service is None:
-            creds, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/drive.readonly"]
-            )
+            creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/drive.readonly"])
             self.service = build("drive", "v3", credentials=creds)
         else:
             self.service = service
@@ -47,13 +44,17 @@ class DriveClient:
         current_token = page_token
 
         while True:
-            response = self.service.changes().list(
-                pageToken=current_token,
-                fields=CHANGE_FIELDS,
-                spaces="drive",
-                includeRemoved=True,
-                pageSize=1000,
-            ).execute()
+            response = (
+                self.service.changes()
+                .list(
+                    pageToken=current_token,
+                    fields=CHANGE_FIELDS,
+                    spaces="drive",
+                    includeRemoved=True,
+                    pageSize=1000,
+                )
+                .execute()
+            )
 
             changes.extend(response.get("changes", []))
 
@@ -88,9 +89,7 @@ class DriveClient:
 
             # Look up parent's parents
             try:
-                parent = self.service.files().get(
-                    fileId=parent_id, fields="parents"
-                ).execute()
+                parent = self.service.files().get(fileId=parent_id, fields="parents").execute()
                 parent_parents = parent.get("parents", [])
                 to_check.extend(parent_parents)
             except Exception:
@@ -119,9 +118,7 @@ class DriveClient:
             parts.append(folder_name)
             # Get parent of parent
             try:
-                parent_file = self.service.files().get(
-                    fileId=current_parent, fields="name,parents"
-                ).execute()
+                parent_file = self.service.files().get(fileId=current_parent, fields="name,parents").execute()
                 parent_parents = parent_file.get("parents", [])
                 current_parent = parent_parents[0] if parent_parents else None
             except Exception:
@@ -135,9 +132,7 @@ class DriveClient:
         if folder_id in self._folder_cache:
             return self._folder_cache[folder_id]
         try:
-            result = self.service.files().get(
-                fileId=folder_id, fields="name"
-            ).execute()
+            result = self.service.files().get(fileId=folder_id, fields="name").execute()
             name = result.get("name")
             self._folder_cache[folder_id] = name
             return name
@@ -162,7 +157,6 @@ class DriveClient:
         """Check if file should be skipped. Returns reason string or None."""
         name = file_data.get("name", "")
         size = file_data.get("size")
-        mime_type = file_data.get("mimeType", "")
 
         # Check extension
         for ext in self.cfg.skip_extensions:
@@ -187,9 +181,7 @@ class DriveClient:
 
     def export_file(self, file_id: str, mime_type: str) -> bytes:
         """Export a Google-native file to the given MIME type."""
-        request = self.service.files().export_media(
-            fileId=file_id, mimeType=mime_type
-        )
+        request = self.service.files().export_media(fileId=file_id, mimeType=mime_type)
         buffer = io.BytesIO()
         downloader = MediaIoBaseDownload(buffer, request)
         done = False
@@ -208,11 +200,15 @@ class DriveClient:
             "type": "web_hook",
             "address": webhook_url,
         }
-        response = self.service.changes().watch(
-            pageToken=page_token,
-            body=body,
-            fields="resourceId,expiration",
-        ).execute()
+        response = (
+            self.service.changes()
+            .watch(
+                pageToken=page_token,
+                body=body,
+                fields="resourceId,expiration",
+            )
+            .execute()
+        )
 
         return {
             "channel_id": channel_id,
@@ -223,10 +219,12 @@ class DriveClient:
     def stop_watch_channel(self, channel_id: str, resource_id: str):
         """Stop a push notification channel."""
         try:
-            self.service.channels().stop(body={
-                "id": channel_id,
-                "resourceId": resource_id,
-            }).execute()
+            self.service.channels().stop(
+                body={
+                    "id": channel_id,
+                    "resourceId": resource_id,
+                }
+            ).execute()
             logger.info(f"Stopped watch channel {channel_id}")
         except Exception:
             logger.warning(f"Failed to stop watch channel {channel_id}", exc_info=True)

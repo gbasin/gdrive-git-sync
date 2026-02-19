@@ -6,10 +6,8 @@
 """
 
 import csv
-import io
 import logging
 import os
-import tempfile
 
 import pdfplumber
 import pypandoc
@@ -27,7 +25,11 @@ EXTRACTABLE = {
 
 # Google-native MIME types → export format → extraction type
 GOOGLE_NATIVE_EXPORTS = {
-    "application/vnd.google-apps.document": ("docx", ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    "application/vnd.google-apps.document": (
+        "docx",
+        ".docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
     "application/vnd.google-apps.spreadsheet": ("csv", ".csv", "text/csv"),
     "application/vnd.google-apps.presentation": ("pdf", ".pdf", "application/pdf"),
 }
@@ -42,17 +44,13 @@ def get_extracted_filename(original_name: str, mime_type: str | None = None) -> 
         fmt, ext, _ = GOOGLE_NATIVE_EXPORTS[mime_type]
         if fmt == "docx":
             return original_name + ext + ".md"
-        elif fmt == "csv":
-            return original_name + ext + ".txt"
-        elif fmt == "pdf":
+        if fmt == "csv" or fmt == "pdf":
             return original_name + ext + ".txt"
 
     _, ext = os.path.splitext(original_name.lower())
     if ext == ".docx":
         return original_name + ".md"
-    elif ext == ".pdf":
-        return original_name + ".txt"
-    elif ext == ".csv":
+    if ext == ".pdf" or ext == ".csv":
         return original_name + ".txt"
     return None
 
@@ -138,7 +136,7 @@ def extract_pdf(file_path: str) -> str:
 
 def extract_csv(file_path: str) -> str:
     """Convert CSV to markdown table."""
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         reader = csv.reader(f)
         rows = list(reader)
 
@@ -163,10 +161,7 @@ def _format_table(rows: list[list[str | None]]) -> str:
             row.append("")
 
     # Calculate column widths
-    widths = [
-        max(len(row[c]) for row in cleaned)
-        for c in range(max_cols)
-    ]
+    widths = [max(len(row[c]) for row in cleaned) for c in range(max_cols)]
     widths = [max(w, 3) for w in widths]  # minimum width of 3
 
     def format_row(row):

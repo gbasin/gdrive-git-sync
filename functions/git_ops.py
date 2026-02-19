@@ -101,10 +101,10 @@ class GitRepo:
 
     def unstage_all(self):
         """Unstage all staged changes (git reset HEAD)."""
-        try:
+        import contextlib
+
+        with contextlib.suppress(subprocess.CalledProcessError):
             self._run(["git", "reset", "HEAD"])
-        except subprocess.CalledProcessError:
-            pass  # OK if nothing to unstage
 
     def has_staged_changes(self) -> bool:
         """Check if there are staged changes."""

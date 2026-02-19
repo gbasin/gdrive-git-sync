@@ -18,19 +18,11 @@ class Config:
 
         # Optional
         self.exclude_paths = self._parse_list(os.environ.get("EXCLUDE_PATHS", ""))
-        self.skip_extensions = self._parse_list(
-            os.environ.get("SKIP_EXTENSIONS", ".zip,.exe,.dmg,.iso")
-        )
+        self.skip_extensions = self._parse_list(os.environ.get("SKIP_EXTENSIONS", ".zip,.exe,.dmg,.iso"))
         self.max_file_size_mb = int(os.environ.get("MAX_FILE_SIZE_MB", "100"))
-        self.commit_author_name = os.environ.get(
-            "COMMIT_AUTHOR_NAME", "Drive Sync Bot"
-        )
-        self.commit_author_email = os.environ.get(
-            "COMMIT_AUTHOR_EMAIL", "sync@example.com"
-        )
-        self.firestore_collection = os.environ.get(
-            "FIRESTORE_COLLECTION", "drive_sync_state"
-        )
+        self.commit_author_name = os.environ.get("COMMIT_AUTHOR_NAME", "Drive Sync Bot")
+        self.commit_author_email = os.environ.get("COMMIT_AUTHOR_EMAIL", "sync@example.com")
+        self.firestore_collection = os.environ.get("FIRESTORE_COLLECTION", "drive_sync_state")
         self.docs_subdir = os.environ.get("DOCS_SUBDIR", "docs")
 
     def _require(self, name: str) -> str:

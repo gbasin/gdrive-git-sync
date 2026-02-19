@@ -70,9 +70,7 @@ def simple_tables_to_pipe(text: str) -> str:
 
                 header_cells = _extract_cells(header_line, col_spans)
                 result.append("| " + " | ".join(header_cells) + " |")
-                result.append(
-                    "| " + " | ".join("-" * len(c) for c in header_cells) + " |"
-                )
+                result.append("| " + " | ".join("-" * len(c) for c in header_cells) + " |")
 
                 # Process body rows until empty line or end
                 i += 1

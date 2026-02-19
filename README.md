@@ -145,13 +145,72 @@ curl -X POST "$(terraform -chdir=infra output -raw setup_watch_url)?initial_sync
 
 At typical usage (a few files/day): **~$0.20/month** (Cloud Scheduler jobs). Everything else falls within GCP free tiers.
 
-## Running tests
+## Development
+
+### Prerequisites
+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) (fast Python package manager)
+- Terraform (for infrastructure)
+
+### Getting started
 
 ```bash
-pip install -r functions/requirements.txt
-pip install pytest
-pytest tests/
+git clone https://github.com/gbasin/gdrive-git-sync.git
+cd gdrive-git-sync
+
+# Install all dependencies (runtime + dev) in a virtual env
+make install
+
+# Run the full CI suite locally
+make ci
 ```
+
+### Available commands
+
+| Command | What it does |
+|---------|-------------|
+| `make install` | Install all deps via uv (creates `.venv` automatically) |
+| `make lint` | Run ruff linter |
+| `make format` | Auto-format code (ruff + terraform fmt) |
+| `make typecheck` | Run mypy type checker |
+| `make test` | Run pytest with coverage |
+| `make ci` | Run lint + typecheck + test (same as CI) |
+| `make deploy` | Package and deploy to GCP |
+| `make clean` | Remove caches and build artifacts |
+
+### Pre-commit hooks
+
+```bash
+uv run pre-commit install
+```
+
+This runs ruff (lint + format) and mypy on every commit.
+
+### Project structure
+
+```
+functions/          # Cloud Function source (deployed to GCP)
+  ├── main.py       # 3 HTTP entry points
+  ├── sync_engine.py # Core orchestration
+  ├── drive_client.py
+  ├── git_ops.py
+  ├── text_extractor.py
+  ├── pandoc_postprocess.py
+  ├── state_manager.py
+  └── config.py
+infra/              # Terraform (Cloud Functions, Scheduler, Firestore, IAM)
+scripts/            # bootstrap.sh, deploy.sh, verify.sh
+tests/              # pytest suite (~100 test cases)
+```
+
+### CI
+
+GitHub Actions runs on every push/PR to `main`:
+- **Lint**: ruff check + format check (via astral-sh/ruff-action)
+- **Typecheck**: mypy via uv
+- **Test**: pytest with coverage threshold (60% minimum)
+- **Terraform**: format check
 
 ## Troubleshooting
 
@@ -174,3 +233,7 @@ pytest tests/
 - docx track changes not showing: verify pandoc version supports `--track-changes=all`
 - PDF tables garbled: pdfplumber works best with text-based PDFs, not scanned images
 - Large files timing out: increase `MAX_FILE_SIZE_MB` or function timeout
+
+## License
+
+MIT

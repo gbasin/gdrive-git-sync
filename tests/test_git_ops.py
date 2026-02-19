@@ -5,12 +5,11 @@ subprocess and Secret Manager are mocked throughout.
 
 import os
 import subprocess
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from config import reset_config
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -96,8 +95,8 @@ class TestClone:
         git_repo.clone()
 
         args = mock_run.call_args[0][0]
-        assert "git" == args[0]
-        assert "clone" == args[1]
+        assert args[0] == "git"
+        assert args[1] == "clone"
         assert "--filter=blob:none" in args
         assert "--branch" in args
         assert "main" in args

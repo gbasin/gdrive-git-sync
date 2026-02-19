@@ -6,10 +6,11 @@ import tempfile
 from dataclasses import dataclass, field
 
 from config import get_config
-from drive_client import DriveClient, GOOGLE_NATIVE_EXPORTS
+from drive_client import DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
-from text_extractor import extract_text, get_extracted_filename, GOOGLE_NATIVE_EXPORTS as NATIVE_EXPORTS
+from text_extractor import GOOGLE_NATIVE_EXPORTS as NATIVE_EXPORTS
+from text_extractor import extract_text, get_extracted_filename
 
 logger = logging.getLogger(__name__)
 
@@ -121,16 +122,12 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     return len(processed)
 
 
-def classify_change(
-    file_id: str, raw: dict, drive: DriveClient, state: StateManager
-) -> Change | None:
+def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateManager) -> Change | None:
     """Classify a Drive change into an action type."""
-    cfg = get_config()
     removed = raw.get("removed", False)
     file_data = raw.get("file", {})
     trashed = file_data.get("trashed", False)
     existing = state.get_file(file_id)
-    mime_type = file_data.get("mimeType", "")
 
     # File removed or trashed
     if removed or trashed:
@@ -189,10 +186,7 @@ def classify_change(
     if old_path != rel_path:
         old_name = existing.get("name")
         new_name = file_data.get("name")
-        if old_name != new_name:
-            change_type = ChangeType.RENAME
-        else:
-            change_type = ChangeType.MOVE
+        change_type = ChangeType.RENAME if old_name != new_name else ChangeType.MOVE
 
         return Change(
             file_id=file_id,
@@ -281,9 +275,7 @@ def _handle_delete(change: Change, repo: GitRepo, state: StateManager, docs_subd
     logger.info(f"Deleted {change.old_path}")
 
 
-def _handle_rename(
-    change: Change, drive: DriveClient, repo: GitRepo, state: StateManager, docs_subdir: str
-):
+def _handle_rename(change: Change, drive: DriveClient, repo: GitRepo, state: StateManager, docs_subdir: str):
     """Rename/move files using git mv, then update content if also modified."""
     old_rel = os.path.join(docs_subdir, change.old_path)
     new_rel = os.path.join(docs_subdir, change.new_path)
@@ -363,7 +355,7 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
                 with open(extracted_tmp, "rb") as f:
                     repo.write_file(os.path.join(docs_subdir, extracted_rel), f.read())
                 # Store extracted path on change for state update
-                if not hasattr(change, '_extracted_path'):
+                if not hasattr(change, "_extracted_path"):
                     change._extracted_path = extracted_rel
                 os.unlink(extracted_tmp)
         finally:
@@ -396,7 +388,7 @@ def group_by_author(changes: list[Change], cfg) -> list[AuthorCommit]:
             path = change.new_path or change.old_path or change.file_id
             descriptions.append(f"  - {change.change_type}: {path}")
 
-        group.message = f"Sync from Google Drive\n\n" + "\n".join(descriptions)
+        group.message = "Sync from Google Drive\n\n" + "\n".join(descriptions)
 
     return list(groups.values())
 
@@ -441,13 +433,16 @@ def update_file_state(change: Change, state: StateManager):
 
     last_user = file_data.get("lastModifyingUser", {})
 
-    state.set_file(change.file_id, {
-        "name": name,
-        "path": path,
-        "md5": file_data.get("md5Checksum"),
-        "mime_type": mime_type,
-        "modified_time": file_data.get("modifiedTime"),
-        "extracted_path": extracted_path,
-        "last_modified_by_name": last_user.get("displayName"),
-        "last_modified_by_email": last_user.get("emailAddress"),
-    })
+    state.set_file(
+        change.file_id,
+        {
+            "name": name,
+            "path": path,
+            "md5": file_data.get("md5Checksum"),
+            "mime_type": mime_type,
+            "modified_time": file_data.get("modifiedTime"),
+            "extracted_path": extracted_path,
+            "last_modified_by_name": last_user.get("displayName"),
+            "last_modified_by_email": last_user.get("emailAddress"),
+        },
+    )

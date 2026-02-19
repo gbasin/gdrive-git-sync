@@ -1,14 +1,10 @@
 """Tests for functions/text_extractor.py."""
 
-import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from text_extractor import (
-    EXTRACTABLE,
-    GOOGLE_NATIVE_EXPORTS,
     _format_table,
     extract_csv,
     extract_docx,
@@ -16,7 +12,6 @@ from text_extractor import (
     extract_text,
     get_extracted_filename,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_extracted_filename

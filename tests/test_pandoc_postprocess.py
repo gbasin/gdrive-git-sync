@@ -1,7 +1,5 @@
 """Tests for functions/pandoc_postprocess.py."""
 
-import pytest
-
 from pandoc_postprocess import (
     _extract_cells,
     _get_column_spans,
@@ -11,7 +9,6 @@ from pandoc_postprocess import (
     simple_tables_to_pipe,
     strip_fenced_divs,
 )
-
 
 # ---------------------------------------------------------------------------
 # strip_fenced_divs
@@ -28,7 +25,7 @@ class TestStripFencedDivs:
         assert "Content here" in result
 
     def test_removes_div_with_multiple_attributes(self):
-        text = '::: {.class1 .class2 #id}\nInner text\n:::\n'
+        text = "::: {.class1 .class2 #id}\nInner text\n:::\n"
         result = strip_fenced_divs(text)
         assert ":::" not in result
         assert "Inner text" in result
@@ -192,11 +189,7 @@ class TestPostprocess:
     """Tests for the combined postprocess pipeline."""
 
     def test_applies_all_transforms(self):
-        text = (
-            "::: {.wrapper}\n"
-            "[important]{.underline}\n"
-            ":::\n"
-        )
+        text = "::: {.wrapper}\n[important]{.underline}\n:::\n"
         result = postprocess(text)
         assert ":::" not in result
         assert "<u>important</u>" in result
@@ -210,15 +203,7 @@ class TestPostprocess:
         assert postprocess("") == ""
 
     def test_all_transforms_combined(self):
-        text = (
-            "::: {.list-item}\n"
-            "Col A   Col B\n"
-            "-----   -----\n"
-            "val1    val2\n"
-            "\n"
-            "[note]{.underline}\n"
-            ":::\n"
-        )
+        text = "::: {.list-item}\nCol A   Col B\n-----   -----\nval1    val2\n\n[note]{.underline}\n:::\n"
         result = postprocess(text)
         assert ":::" not in result
         assert "<u>note</u>" in result

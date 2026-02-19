@@ -10,7 +10,6 @@ import pytest
 
 from config import reset_config
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -70,7 +69,9 @@ class TestPageToken:
 
     def test_set_page_token(self):
         sm, mock_db = _make_state_manager()
-        set_mock = mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        set_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        )
 
         sm.set_page_token("new_token")
         set_mock.assert_called_once_with({"token": "new_token"})
@@ -102,18 +103,24 @@ class TestWatchChannel:
 
     def test_set_watch_channel(self):
         sm, mock_db = _make_state_manager()
-        set_mock = mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        set_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        )
 
         sm.set_watch_channel("ch1", "res1", 9999)
-        set_mock.assert_called_once_with({
-            "channel_id": "ch1",
-            "resource_id": "res1",
-            "expiration": 9999,
-        })
+        set_mock.assert_called_once_with(
+            {
+                "channel_id": "ch1",
+                "resource_id": "res1",
+                "expiration": 9999,
+            }
+        )
 
     def test_clear_watch_channel(self):
         sm, mock_db = _make_state_manager()
-        delete_mock = mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        delete_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        )
 
         sm.clear_watch_channel()
         delete_mock.assert_called_once()
@@ -207,11 +214,13 @@ class TestReleaseLock:
         sm._config_ref = MagicMock(return_value=lock_ref)
 
         sm.release_lock()
-        lock_ref.set.assert_called_once_with({
-            "locked": False,
-            "owner": None,
-            "acquired_at": None,
-        })
+        lock_ref.set.assert_called_once_with(
+            {
+                "locked": False,
+                "owner": None,
+                "acquired_at": None,
+            }
+        )
 
     def test_release_lock_noop_when_different_owner(self):
         sm, mock_db = _make_state_manager()
@@ -249,7 +258,9 @@ class TestFileTracking:
         sm, mock_db = _make_state_manager()
 
         # set_file
-        set_mock = mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        set_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        )
         data = {"name": "report.docx", "path": "Reports/report.docx", "md5": "abc"}
         sm.set_file("file1", data)
         set_mock.assert_called_once_with(data)
@@ -271,7 +282,9 @@ class TestFileTracking:
 
     def test_delete_file(self):
         sm, mock_db = _make_state_manager()
-        delete_mock = mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        delete_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        )
 
         sm.delete_file("file1")
         delete_mock.assert_called_once()
