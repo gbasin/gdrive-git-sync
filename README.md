@@ -204,6 +204,12 @@ scripts/            # bootstrap.sh, deploy.sh, verify.sh
 tests/              # pytest suite (~100 test cases)
 ```
 
+### Dependency management
+
+`pyproject.toml` is the source of truth. `uv.lock` pins exact versions for reproducible local dev.
+
+`functions/requirements.txt` is a separate runtime manifest for Cloud Functions deployment — Google's buildpack doesn't support uv, so it needs a plain requirements file. Keep both in sync when adding dependencies.
+
 ### CI
 
 GitHub Actions runs on every push/PR to `main`:
