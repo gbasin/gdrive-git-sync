@@ -1,6 +1,13 @@
 # gdrive-git-sync
 
+![CI](https://github.com/gbasin/gdrive-git-sync/actions/workflows/ci.yml/badge.svg)
+![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Terraform](https://img.shields.io/badge/IaC-Terraform-purple.svg)
+
 Automatically version-control files from Google Drive in a git repository with meaningful content diffs.
+
+<!-- TODO: Add a screenshot showing `git diff` on a changed .docx file — this is the money shot -->
 
 Files dropped in a Drive folder appear in git with extracted text alongside the originals. `git diff` shows actual content changes, not binary blobs. Commits are attributed to the person who edited the file in Drive.
 
@@ -59,13 +66,18 @@ docs/
 
 ## Setup
 
-The interactive setup script walks you through everything:
-
 ```bash
 make setup
 ```
 
-This checks prerequisites (installing missing tools via brew), creates your `.env`, authenticates with GCP, enables APIs, deploys infrastructure, and stores your git token — all in one guided flow. It's idempotent, so you can re-run it safely.
+The interactive setup installs missing tools via brew, creates your `.env`, creates a GCP project (or uses an existing one), links billing, enables APIs, deploys infrastructure, and stores your git token. It's crash-safe and idempotent — if anything fails, re-run and it picks up where it left off.
+
+**Dry run** — preview every step without executing anything:
+
+```bash
+make setup             # then choose --dry-run when prompted
+./scripts/setup.sh --dry-run
+```
 
 **Non-interactive / agent mode** — for CI or AI-agent-driven setup:
 
@@ -230,8 +242,8 @@ functions/          # Cloud Function source (deployed to GCP)
   ├── state_manager.py
   └── config.py
 infra/              # Terraform (Cloud Functions, Scheduler, Firestore, IAM)
-scripts/            # bootstrap.sh, deploy.sh, verify.sh
-tests/              # pytest suite (~100 test cases)
+scripts/            # setup.sh (guided onboarding), bootstrap.sh, deploy.sh, verify.sh
+tests/              # pytest suite (~190 test cases)
 ```
 
 ### Dependency management
@@ -247,6 +259,50 @@ GitHub Actions runs on every push/PR to `main`:
 - **Typecheck**: mypy via uv
 - **Test**: pytest with coverage threshold (60% minimum)
 - **Terraform**: format check
+
+## GCP free tier
+
+Every GCP service this project uses has a free tier. Typical small-team usage stays well within it:
+
+| Service | Free tier | What this project uses it for |
+|---------|-----------|-------------------------------|
+| Cloud Functions (2nd gen) | 2M invocations/month | Webhook handler, watch renewal, setup |
+| Firestore | 1 GiB storage, 50K reads/day | Page tokens, lock state, watch channel info |
+| Secret Manager | 10K access operations/month | Git push token |
+| Cloud Scheduler | 3 jobs free | Watch renewal (1 job), safety-net poll (1 job) |
+| Cloud Build | 120 build-minutes/day | Function deployments |
+
+Beyond free tier, costs scale with Drive activity. See [GCP pricing](https://cloud.google.com/pricing) for details.
+
+## Security
+
+- **Service account** — Gets read-only access to the monitored Drive folder plus Firestore read/write. No broader GCP permissions.
+- **Git token** — Stored in Secret Manager, never in environment variables or source code. The Cloud Function reads it at runtime.
+- **Webhook endpoint** — Cloud Functions (2nd gen) runs on Cloud Run, which is authenticated by default. Google's Drive API validates the webhook URL via domain verification.
+- **No data storage beyond** — Firestore holds only page tokens, lock state, and watch channel metadata. File contents pass through the function transiently and land only in the git repo.
+
+## Limitations
+
+- **Scanned/image-only PDFs** — pdfplumber extracts text from text-based PDFs only. Scanned pages produce a warning and no extracted text.
+- **Binary formats beyond docx/pdf/csv** — Committed as-is without text extraction. `git diff` won't show meaningful changes for these.
+- **Single Drive folder** — Monitors one folder (including subfolders). For multiple unrelated folders, deploy separate instances.
+- **Google Workspace restrictions** — Workspace admins can restrict Drive API access or webhook delivery. Check with your admin if webhooks don't arrive.
+- **Large files** — Files over `MAX_FILE_SIZE_MB` (default 100MB) are skipped to stay within Cloud Function memory/timeout limits.
+- **Webhook delivery** — Google doesn't guarantee webhook delivery. The 4-hour safety-net poll catches anything missed.
+
+## Teardown
+
+To remove all deployed resources:
+
+```bash
+cd infra
+terraform destroy
+```
+
+Then clean up:
+1. **Revoke the Drive share** — Remove the service account from your Drive folder
+2. **Delete the git token** — Revoke the personal access token from your git host
+3. **Delete the GCP project** (optional) — If you created a project just for this: `gcloud projects delete <project-id>`
 
 ## Troubleshooting
 
