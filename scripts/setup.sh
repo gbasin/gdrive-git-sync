@@ -91,15 +91,17 @@ spin() {
     echo ""
     hint "Fix the issue above and re-run: make setup"
     rm -f "$logfile"
-    exit 1
+    ERROR_HANDLED=true; exit 1
   fi
   rm -f "$logfile"
 }
 
 # ── Error handler ────────────────────────────────────────────────────
+ERROR_HANDLED=false  # set to true when a specific error message was already shown
 cleanup() {
   local rc=$?
   [ $rc -eq 0 ] && return
+  $ERROR_HANDLED && return
   echo ""
   fail "Something went wrong."
   hint "You can safely re-run this — it picks up where it left off: make setup"
@@ -229,11 +231,11 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
             ok "$cmd installed (sourced PATH from brew)"
           else
             fail "$cmd installed but not in PATH — restart your terminal and re-run"
-            exit 1
+            ERROR_HANDLED=true; exit 1
           fi
         else
           fail "$cmd install succeeded but command not found — restart your terminal and re-run"
-          exit 1
+          ERROR_HANDLED=true; exit 1
         fi
       done
     else
@@ -241,7 +243,7 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
         hint "Install manually: $(install_url "$cmd")"
       done
       fail "Install missing tools, then re-run."
-      exit 1
+      ERROR_HANDLED=true; exit 1
     fi
   fi
 
@@ -252,7 +254,7 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
       hint "$cmd → $(install_url "$cmd")"
     done
     fail "Install them manually, then re-run."
-    exit 1
+    ERROR_HANDLED=true; exit 1
   fi
 fi
 
@@ -321,7 +323,7 @@ elif $AUTO; then
   fail ".env not found. In non-interactive mode, .env must exist."
   hint "Create it from the example:  cp .env.example .env"
   hint "Then fill in the values and re-run."
-  exit 1
+  ERROR_HANDLED=true; exit 1
 else
   # ── Check for previous partial run ──────────────────────────────────
   # If gcloud has a project set from a previous run that crashed before
@@ -479,12 +481,12 @@ ENVEOF
           hint "  2. You'll see a Terms of Service prompt — accept it"
           hint "  3. Come back here and re-run: make setup"
           rm -f "$CREATE_LOG"
-          exit 1
+          ERROR_HANDLED=true; exit 1
         elif grep -q "already in use" "$CREATE_LOG"; then
           printf "\r  ${RED}✘${NC} That project ID is already taken by someone else.\n"
           hint "Try a different name — re-run: make setup"
           rm -f "$CREATE_LOG"
-          exit 1
+          ERROR_HANDLED=true; exit 1
         else
           printf "\r  ${RED}✘${NC} Creating project failed:\n"
           echo ""
@@ -492,7 +494,7 @@ ENVEOF
           echo ""
           hint "Fix the issue above and re-run: make setup"
           rm -f "$CREATE_LOG"
-          exit 1
+          ERROR_HANDLED=true; exit 1
         fi
         rm -f "$CREATE_LOG"
       fi
@@ -784,12 +786,12 @@ elif $AUTO; then
     hint "Before running in non-interactive mode, authenticate with one of:"
     hint "  gcloud auth login && gcloud auth application-default login"
     hint "  export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json"
-    exit 1
+    ERROR_HANDLED=true; exit 1
   fi
   if [ ! -f "$ADC_FILE" ] && [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
     fail "Terraform needs application-default credentials."
     hint "Run: gcloud auth application-default login"
-    exit 1
+    ERROR_HANDLED=true; exit 1
   fi
 elif $FULL_AUTH_DONE; then
   # Already did both gcloud auth + ADC during project creation in Phase 2
