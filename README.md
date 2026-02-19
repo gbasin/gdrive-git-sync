@@ -173,9 +173,6 @@ curl -X POST "$(terraform -chdir=infra output -raw setup_watch_url)?initial_sync
 - **Concurrency**: Triple protection (max_instances=1, max_concurrency=1, Firestore distributed lock with 10-min TTL)
 - **Deduplication**: md5 checksums prevent redundant commits
 
-## Cost
-
-At typical usage (a few files/day): **~$0.20/month** (Cloud Scheduler jobs). Everything else falls within GCP free tiers.
 
 ## Development
 

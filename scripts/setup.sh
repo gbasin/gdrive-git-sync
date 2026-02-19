@@ -312,8 +312,7 @@ else
   echo ""
   printf "  ${BOLD}A) Google Cloud project${NC}\n"
   hint "This is where your Cloud Functions, database, and secrets will live."
-  hint "It runs on Google Cloud Platform (GCP) — there's a generous free tier"
-  hint "and this project costs about \$0.20/month."
+  hint "It runs on Google Cloud Platform (GCP)."
   echo ""
   read -rp "  Do you already have a GCP project for this? [y/N]: " HAS_PROJECT
 
@@ -333,7 +332,7 @@ else
     hint "No problem — we'll create one. You'll need:"
     hint "  • A Google account (any Gmail address works)"
     hint "  • A billing account with a credit card on file"
-    hint "    (the free tier covers almost everything — this project costs ~\$0.20/month)"
+    hint "    (there's a generous free tier for low-usage projects like this)"
 
     # ── Auth (both gcloud + ADC together) ──
     echo ""
@@ -363,9 +362,8 @@ else
     if [ -z "$BILLING_ACCOUNTS" ]; then
       echo ""
       warn "You don't have a billing account yet."
-      hint "Cloud Functions requires billing, but the free tier covers this project."
-      hint "You'll need a credit card — Google won't charge you unless you exceed"
-      hint "free-tier limits (which this project won't)."
+      hint "Cloud Functions requires billing to be enabled."
+      hint "You'll need a credit card on file."
       echo ""
       info "Let's set one up:"
       hint "1. Go to: https://console.cloud.google.com/billing/create"
