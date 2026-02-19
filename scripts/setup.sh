@@ -102,7 +102,7 @@ cleanup() {
   [ $rc -eq 0 ] && return
   echo ""
   fail "Something went wrong."
-  hint "This script is idempotent — just fix the issue and re-run: make setup"
+  hint "You can safely re-run this — it picks up where it left off: make setup"
 }
 trap cleanup EXIT
 trap 'echo ""; echo "  Interrupted."; exit 130' INT
@@ -307,14 +307,15 @@ fi
 
 if $ENV_COMPLETE; then
   : # nothing to do — .env is complete
-elif $DRY_RUN && [ ! -f "$ENV_FILE" ]; then
-  ok "Using placeholder values [dry-run]"
-  GCP_PROJECT="my-project-12345"
-  DRIVE_FOLDER_ID="1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
-  GIT_REPO_URL="https://github.com/yourname/drive-sync.git"
-  GIT_BRANCH="main"
-  GIT_TOKEN_SECRET="git-token"
-  GIT_TOKEN_VALUE="ghp_xxxxxxxxxxxxxxxxxxxx"
+elif $DRY_RUN; then
+  # Fill in placeholders for any missing values so dry-run never prompts
+  GCP_PROJECT="${GCP_PROJECT:-my-project-12345}"
+  DRIVE_FOLDER_ID="${DRIVE_FOLDER_ID:-1aBcDeFgHiJkLmNoPqRsTuVwXyZ}"
+  GIT_REPO_URL="${GIT_REPO_URL:-https://github.com/yourname/drive-sync.git}"
+  GIT_BRANCH="${GIT_BRANCH:-main}"
+  GIT_TOKEN_SECRET="${GIT_TOKEN_SECRET:-git-token}"
+  GIT_TOKEN_VALUE="${GIT_TOKEN_VALUE:-ghp_xxxxxxxxxxxxxxxxxxxx}"
+  ok "Using placeholder values for missing fields [dry-run]"
   hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
 elif $AUTO; then
   fail ".env not found. In non-interactive mode, .env must exist."
@@ -444,7 +445,7 @@ ENVEOF
       PROJECT_EXISTS=false
       if $DRY_RUN; then
         PROJECT_EXISTS=false  # simulate creation path in dry-run
-      elif gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
+      elif gcloud projects describe "$GCP_PROJECT" &>/dev/null; then
         PROJECT_EXISTS=true
       fi
 
@@ -697,7 +698,7 @@ ENVEOF
       [[ "${CONTINUE:-Y}" =~ ^[Nn] ]] && exit 1
     fi
   else
-    ok "Token saved (couldn't auto-verify for this host)"
+    ok "Token received (couldn't auto-verify for this host)"
   fi
 
   GIT_TOKEN_SECRET="git-token"
@@ -817,7 +818,7 @@ BUCKET="${GCP_PROJECT}-functions-source"
 BUCKET_EXISTS=false
 if $DRY_RUN; then
   BUCKET_EXISTS=true
-elif gcloud storage buckets describe "gs://$BUCKET" &>/dev/null 2>&1; then
+elif gcloud storage buckets describe "gs://$BUCKET" &>/dev/null; then
   BUCKET_EXISTS=true
 fi
 
@@ -891,8 +892,17 @@ elif $AUTO; then
 else
   echo ""
   info "No git token found in Secret Manager."
-  hint "GitHub → Settings → Developer Settings → Fine-grained tokens"
-  hint "GitLab → Settings → Access Tokens"
+  # Give host-specific instructions (same as Section D in Phase 2)
+  if [[ "${GIT_REPO_URL:-}" =~ github\.com ]]; then
+    hint "Create one at: https://github.com/settings/tokens?type=beta"
+    hint "  → Generate new token → Repository access: your repo"
+    hint "  → Permissions → Contents → Read and write → Generate"
+  elif [[ "${GIT_REPO_URL:-}" =~ gitlab\.com ]]; then
+    hint "Open your repo → Settings → Access Tokens"
+    hint "  → Scope: write_repository → Create"
+  else
+    hint "Create a personal access token with push (write) access to your repo."
+  fi
   echo ""
   hint "Paste it below. (Nothing will appear as you type — that's normal.)"
   while true; do
@@ -967,8 +977,8 @@ hint "This command tells Google Drive to start sending change notifications"
 hint "to your sync function. It also does an initial sync of existing files."
 hint "Run this in your terminal:"
 echo ""
-echo -e "    ${DIM}curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\${NC}"
-echo -e "    ${DIM}  -H \"Authorization: bearer \$(gcloud auth print-identity-token)\"${NC}"
+echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
+echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
 echo ""
 hint "You should see a JSON response with \"status\": \"ok\"."
 hint "After that, any file added or edited in the Drive folder will"
