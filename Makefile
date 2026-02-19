@@ -1,4 +1,4 @@
-.PHONY: install lint format typecheck test ci deploy clean lock
+.PHONY: install lint format typecheck test ci deploy setup clean lock
 
 install:
 	uv sync --all-extras
@@ -24,6 +24,9 @@ ci: lint typecheck test
 
 deploy:
 	./scripts/deploy.sh
+
+setup:
+	./scripts/setup.sh
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov

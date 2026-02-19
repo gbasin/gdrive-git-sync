@@ -59,29 +59,50 @@ docs/
 
 ## Setup
 
-### 1. Bootstrap GCP project
+The interactive setup script walks you through everything:
+
+```bash
+make setup
+```
+
+This checks prerequisites, creates your `.env`, authenticates with GCP, enables APIs, deploys infrastructure, and stores your git token — all in one guided flow. It's idempotent, so you can re-run it safely.
+
+To redeploy after code changes:
+
+```bash
+make deploy
+```
+
+<details>
+<summary>Manual setup (step-by-step)</summary>
+
+### 1. Configure environment
 
 ```bash
 cp .env.example .env
 # Edit .env with your values
+```
 
+### 2. Bootstrap GCP project
+
+```bash
 GCP_PROJECT=my-project ./scripts/bootstrap.sh
 ```
 
-### 2. Add git token to Secret Manager
+### 3. Add git token to Secret Manager
 
 ```bash
-# GitHub example (fine-grained token with Contents read/write on target repo)
+# GitHub: fine-grained token with Contents read/write on target repo
 echo -n "github_pat_XXXX" | gcloud secrets versions add git-token --data-file=-
 ```
 
-### 3. Deploy
+### 4. Deploy
 
 ```bash
-./scripts/deploy.sh
+make deploy
 ```
 
-### 4. Domain verification (one-time)
+### 5. Domain verification (one-time)
 
 Drive webhooks require proving ownership of the webhook URL:
 
@@ -93,17 +114,19 @@ Drive webhooks require proving ownership of the webhook URL:
 
 **Alternative**: Map a custom domain to Cloud Run and verify via DNS TXT record.
 
-### 5. Share Drive folder
+### 6. Share Drive folder
 
 Share your target Drive folder with the service account email (shown in deploy output) with **Editor** access.
 
-### 6. Initialize
+### 7. Initialize
 
 ```bash
 # Create watch channel and optionally do an initial sync
 curl -X POST "$(terraform -chdir=infra output -raw setup_watch_url)?initial_sync=true" \
   -H "Authorization: bearer $(gcloud auth print-identity-token)"
 ```
+
+</details>
 
 ## Configuration
 
@@ -176,6 +199,7 @@ make ci
 | `make typecheck` | Run mypy type checker |
 | `make test` | Run pytest with coverage |
 | `make ci` | Run lint + typecheck + test (same as CI) |
+| `make setup` | Interactive first-time setup (guided) |
 | `make deploy` | Package and deploy to GCP |
 | `make clean` | Remove caches and build artifacts |
 
