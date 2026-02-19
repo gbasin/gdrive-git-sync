@@ -143,7 +143,8 @@ def extract_csv(file_path: str) -> str:
     if not rows:
         return ""
 
-    return _format_table(rows)
+    # csv.reader yields list[str]; _format_table accepts str | None for pdfplumber compat
+    return _format_table(rows)  # type: ignore[arg-type]
 
 
 def _format_table(rows: list[list[str | None]]) -> str:

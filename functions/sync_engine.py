@@ -40,8 +40,7 @@ class AuthorCommit:
     author_name: str
     author_email: str
     message: str
-    files: list[tuple[str, bytes | None]] = field(default_factory=list)
-    # (rel_path, content_bytes) — None content means delete
+    files: list["Change"] = field(default_factory=list)
 
 
 def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
@@ -67,13 +66,13 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
 
     # Deduplicate: keep latest change per fileId
     deduped: dict[str, dict] = {}
-    for change in raw_changes:
-        file_id = change.get("fileId")
+    for raw_item in raw_changes:
+        file_id = raw_item.get("fileId")
         if file_id:
-            deduped[file_id] = change
+            deduped[file_id] = raw_item
 
     # Classify each change
-    changes = []
+    changes: list[Change] = []
     for file_id, raw in deduped.items():
         change = classify_change(file_id, raw, drive, state)
         if change and change.change_type != ChangeType.SKIP:
@@ -277,6 +276,8 @@ def _handle_delete(change: Change, repo: GitRepo, state: StateManager, docs_subd
 
 def _handle_rename(change: Change, drive: DriveClient, repo: GitRepo, state: StateManager, docs_subdir: str):
     """Rename/move files using git mv, then update content if also modified."""
+    if not change.old_path or not change.new_path:
+        return
     old_rel = os.path.join(docs_subdir, change.old_path)
     new_rel = os.path.join(docs_subdir, change.new_path)
 
@@ -320,6 +321,8 @@ def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, doc
 def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, docs_subdir: str):
     """Download a file from Drive, write original to repo, extract text alongside it."""
     file_data = change.file_data
+    assert file_data is not None
+    assert change.new_path is not None
     mime_type = file_data.get("mimeType", "")
     name = file_data.get("name", "unknown")
 
@@ -354,9 +357,6 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
             if extract_text(tmp_path, extracted_tmp, mime_type):
                 with open(extracted_tmp, "rb") as f:
                     repo.write_file(os.path.join(docs_subdir, extracted_rel), f.read())
-                # Store extracted path on change for state update
-                if not hasattr(change, "_extracted_path"):
-                    change._extracted_path = extracted_rel
                 os.unlink(extracted_tmp)
         finally:
             os.unlink(tmp_path)
@@ -404,11 +404,11 @@ def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str):
         if change.new_path:
             repo.stage_file(os.path.join(docs_subdir, change.new_path))
     else:
-        if change.new_path:
+        if change.new_path and change.file_data:
             # For Google-native files, _download_and_extract writes to
             # name + export extension (e.g. "My Doc.docx"), not new_path
             # ("My Doc").  Compute the actual path so we stage the right file.
-            mime_type = change.file_data.get("mimeType", "") if change.file_data else ""
+            mime_type = change.file_data.get("mimeType", "")
             if mime_type in NATIVE_EXPORTS:
                 _, ext, _ = NATIVE_EXPORTS[mime_type]
                 name = change.file_data.get("name", "")
@@ -419,14 +419,15 @@ def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str):
             else:
                 repo.stage_file(os.path.join(docs_subdir, change.new_path))
             # Also stage extracted file
-            if change.file_data:
-                name = change.file_data.get("name", "")
-                mime_type = change.file_data.get("mimeType", "")
-                extracted_name = get_extracted_filename(name, mime_type)
-                if extracted_name:
-                    dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
-                    extracted_path = os.path.join(dir_part, extracted_name) if dir_part else extracted_name
-                    repo.stage_file(os.path.join(docs_subdir, extracted_path))
+            name = change.file_data.get("name", "")
+            mime_type = change.file_data.get("mimeType", "")
+            extracted_name = get_extracted_filename(name, mime_type)
+            if extracted_name:
+                dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
+                extracted_path = os.path.join(dir_part, extracted_name) if dir_part else extracted_name
+                repo.stage_file(os.path.join(docs_subdir, extracted_path))
+        elif change.new_path:
+            repo.stage_file(os.path.join(docs_subdir, change.new_path))
 
 
 def update_file_state(change: Change, state: StateManager):

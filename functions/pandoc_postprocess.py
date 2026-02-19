@@ -52,7 +52,7 @@ def simple_tables_to_pipe(text: str) -> str:
       | val3  | val4  |
     """
     lines = text.split("\n")
-    result = []
+    result: list[str] = []
     i = 0
 
     while i < len(lines):

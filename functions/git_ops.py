@@ -22,14 +22,15 @@ class GitRepo:
         self.cfg = get_config()
         self.work_dir = work_dir or tempfile.mkdtemp(prefix="gdrive-sync-")
         self.repo_path = os.path.join(self.work_dir, "repo")
-        self._token = None
+        self._token: str | None = None
 
     def _get_token(self) -> str:
-        if self._token is None:
-            client = secretmanager.SecretManagerServiceClient()
-            name = f"projects/{self.cfg.gcp_project}/secrets/{self.cfg.git_token_secret}/versions/latest"
-            response = client.access_secret_version(request={"name": name})
-            self._token = response.payload.data.decode("utf-8").strip()
+        if self._token is not None:
+            return self._token
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{self.cfg.gcp_project}/secrets/{self.cfg.git_token_secret}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        self._token = response.payload.data.decode("utf-8").strip()
         return self._token
 
     def _auth_url(self) -> str:

@@ -11,7 +11,7 @@ import logging
 import time
 import uuid
 
-from google.cloud import firestore
+from google.cloud import firestore  # type: ignore[attr-defined]
 
 from config import get_config
 
@@ -89,7 +89,7 @@ class StateManager:
             return True
 
         transaction = self.db.transaction()
-        return _acquire(transaction)
+        return bool(_acquire(transaction))
 
     def release_lock(self):
         """Release the sync lock if we own it."""
@@ -109,7 +109,7 @@ class StateManager:
 
     def is_resync_needed(self) -> bool:
         doc = self._config_ref("resync_needed").get()
-        return doc.exists and doc.to_dict().get("needed", False)
+        return bool(doc.exists and doc.to_dict().get("needed", False))
 
     # --- File tracking (subcollection) ---
 

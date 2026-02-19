@@ -67,7 +67,7 @@ class DriveClient:
     def get_start_page_token(self) -> str:
         """Get the current start page token for changes.list."""
         response = self.service.changes().getStartPageToken().execute()
-        return response["startPageToken"]
+        return str(response["startPageToken"])
 
     def is_in_folder(self, file_data: dict) -> bool:
         """Check if a file is under the monitored folder by walking parents."""
@@ -108,7 +108,7 @@ class DriveClient:
         parents = file_data.get("parents", [])
 
         if not parents:
-            return name
+            return str(name)
 
         current_parent = parents[0]
         while current_parent and current_parent != self.cfg.drive_folder_id:
@@ -133,7 +133,7 @@ class DriveClient:
             return self._folder_cache[folder_id]
         try:
             result = self.service.files().get(fileId=folder_id, fields="name").execute()
-            name = result.get("name")
+            name: str | None = result.get("name")
             self._folder_cache[folder_id] = name
             return name
         except Exception:
