@@ -44,18 +44,6 @@ phase() {
   printf "${BOLD}[$1] $2${NC}\n"
 }
 
-# Prompt helper — in auto mode, uses default; in interactive mode, asks.
-ask() {
-  local prompt="$1" default="${2:-}" var_name="$3"
-  if $AUTO; then
-    printf -v "$var_name" '%s' "$default"
-    return
-  fi
-  local input
-  read -rp "  $prompt" input
-  printf -v "$var_name" '%s' "${input:-$default}"
-}
-
 # Spinner — runs a command in the background, shows elapsed time.
 spin() {
   local msg="$1"; shift
@@ -125,6 +113,7 @@ brew_pkg() {
     terraform) echo "hashicorp/tap/terraform" ;;
     git)       echo "git" ;;
     zip)       echo "zip" ;;
+    gh)        echo "gh" ;;
   esac
 }
 
@@ -134,6 +123,7 @@ apt_pkg() {
     terraform) echo "" ;;  # no simple apt package
     git)       echo "git" ;;
     zip)       echo "zip" ;;
+    gh)        echo "" ;;  # needs special repo setup
   esac
 }
 
@@ -143,10 +133,11 @@ install_url() {
     terraform) echo "https://developer.hashicorp.com/terraform/install" ;;
     git)       echo "https://git-scm.com/downloads" ;;
     zip)       echo "your system package manager" ;;
+    gh)        echo "https://cli.github.com" ;;
   esac
 }
 
-# Check what's missing
+# ── Required tools ──
 MISSING_TOOLS=()
 for cmd in gcloud terraform git zip; do
   if command -v "$cmd" &>/dev/null; then
@@ -157,11 +148,10 @@ for cmd in gcloud terraform git zip; do
   fi
 done
 
-# Install missing tools
+# Install missing required tools
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo ""
 
-  # Determine what we can auto-install
   CAN_INSTALL=()
   MANUAL_INSTALL=()
   for cmd in "${MISSING_TOOLS[@]}"; do
@@ -174,7 +164,6 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
     fi
   done
 
-  # Install what we can
   if [ ${#CAN_INSTALL[@]} -gt 0 ]; then
     INSTALL_LIST=$(printf ", %s" "${CAN_INSTALL[@]}"); INSTALL_LIST=${INSTALL_LIST:2}
 
@@ -188,7 +177,6 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
     fi
 
     if $DO_INSTALL; then
-      # Tap hashicorp if we need terraform via brew
       if [ "$PKG_MGR" = "brew" ]; then
         for cmd in "${CAN_INSTALL[@]}"; do
           if [ "$cmd" = "terraform" ]; then
@@ -206,28 +194,24 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
         fi
       done
 
-      # Verify installations
       for cmd in "${CAN_INSTALL[@]}"; do
         if command -v "$cmd" &>/dev/null; then
           ok "$cmd installed"
-        else
-          # gcloud via brew cask may need PATH sourcing
-          if [ "$cmd" = "gcloud" ] && [ "$PKG_MGR" = "brew" ]; then
-            GCLOUD_PATH="$(brew --prefix)/share/google-cloud-sdk"
-            if [ -f "$GCLOUD_PATH/path.bash.inc" ]; then
-              # shellcheck disable=SC1091
-              source "$GCLOUD_PATH/path.bash.inc"
-            fi
-            if command -v gcloud &>/dev/null; then
-              ok "$cmd installed (sourced PATH from brew)"
-            else
-              fail "$cmd installed but not in PATH — restart your terminal and re-run"
-              exit 1
-            fi
+        elif [ "$cmd" = "gcloud" ] && [ "$PKG_MGR" = "brew" ]; then
+          GCLOUD_PATH="$(brew --prefix)/share/google-cloud-sdk"
+          if [ -f "$GCLOUD_PATH/path.bash.inc" ]; then
+            # shellcheck disable=SC1091
+            source "$GCLOUD_PATH/path.bash.inc"
+          fi
+          if command -v gcloud &>/dev/null; then
+            ok "$cmd installed (sourced PATH from brew)"
           else
-            fail "$cmd install succeeded but command not found — restart your terminal and re-run"
+            fail "$cmd installed but not in PATH — restart your terminal and re-run"
             exit 1
           fi
+        else
+          fail "$cmd install succeeded but command not found — restart your terminal and re-run"
+          exit 1
         fi
       done
     else
@@ -239,7 +223,6 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
     fi
   fi
 
-  # Report anything we couldn't auto-install
   if [ ${#MANUAL_INSTALL[@]} -gt 0 ]; then
     echo ""
     fail "These tools can't be auto-installed on this system:"
@@ -251,13 +234,31 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   fi
 fi
 
+# ── Optional: GitHub CLI for automatic repo creation ──
+if ! command -v gh &>/dev/null; then
+  if [ "$PKG_MGR" = "brew" ]; then
+    echo ""
+    DO_GH=false
+    if $AUTO; then
+      info "Installing gh (GitHub CLI) for automatic repo creation"
+      DO_GH=true
+    else
+      read -rp "  Install GitHub CLI (gh) for automatic repo creation? [Y/n]: " GH_ANSWER
+      [[ ! "${GH_ANSWER:-Y}" =~ ^[Nn] ]] && DO_GH=true
+    fi
+    if $DO_GH; then
+      spin "Installing gh" brew install gh
+      ok "gh installed"
+    fi
+  fi
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Phase 2 — Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 phase "2/4" "Configuration"
 
-FIRST_RUN=false
-GCP_AUTH_DONE=false
+FULL_AUTH_DONE=false
 GIT_TOKEN_VALUE="${GIT_TOKEN_VALUE:-}"  # accept from env for agent mode
 
 if [ -f "$ENV_FILE" ]; then
@@ -274,19 +275,20 @@ elif $AUTO; then
   hint "Then fill in the values and re-run."
   exit 1
 else
-  FIRST_RUN=true
   info "We need four things. I'll walk you through each one."
 
-  # ── 1. GCP project ──
+  # ── A) GCP project ──────────────────────────────────────────────────
   echo ""
   printf "  ${BOLD}A) Google Cloud project${NC}\n"
   hint "This is where your Cloud Functions, database, and secrets will live."
+  hint "It runs on Google Cloud Platform (GCP) — there's a generous free tier"
+  hint "and this project costs about \$0.20/month."
   echo ""
-  read -rp "  Do you already have a GCP project? [y/N]: " HAS_PROJECT
+  read -rp "  Do you already have a GCP project for this? [y/N]: " HAS_PROJECT
 
   if [[ "${HAS_PROJECT:-}" =~ ^[Yy] ]]; then
-    hint "The project ID is the lowercase string in the URL or project switcher"
-    hint "(e.g. \"drive-sync-429301\" — NOT the display name)."
+    hint "Find your project ID at console.cloud.google.com — it's the lowercase"
+    hint "string in the URL or project switcher (e.g. \"drive-sync-429301\")."
     echo ""
     while true; do
       read -rp "  Project ID: " GCP_PROJECT
@@ -297,8 +299,62 @@ else
       hint "Example: my-project-123456"
     done
   else
-    hint "No problem — we'll create one for you."
-    # Generate a suggested project ID
+    hint "No problem — we'll create one. You'll need:"
+    hint "  • A Google account (any Gmail address works)"
+    hint "  • A billing account with a credit card on file"
+    hint "    (the free tier covers almost everything — this project costs ~\$0.20/month)"
+
+    # ── Auth (both gcloud + ADC together) ──
+    echo ""
+    CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+    if [ -n "$CURRENT_ACCOUNT" ]; then
+      ok "Already logged in as $CURRENT_ACCOUNT"
+    else
+      info "Let's log in to Google Cloud. Two browser windows will open:"
+      hint "1) Sign in with the Google account you want to use for this project"
+      hint "2) Authorize Terraform (the tool that sets up your infrastructure)"
+      echo ""
+      read -rp "  Press Enter to open the browser..."
+      gcloud auth login
+      ok "Logged in to gcloud"
+    fi
+    ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
+    if [ ! -f "$ADC_FILE" ]; then
+      info "One more sign-in — this one is for Terraform..."
+      gcloud auth application-default login
+      ok "Terraform credentials saved"
+    fi
+    FULL_AUTH_DONE=true
+
+    # ── Check billing ──
+    BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+
+    if [ -z "$BILLING_ACCOUNTS" ]; then
+      echo ""
+      warn "You don't have a billing account yet."
+      hint "Cloud Functions requires billing, but the free tier covers this project."
+      hint "You'll need a credit card — Google won't charge you unless you exceed"
+      hint "free-tier limits (which this project won't)."
+      echo ""
+      info "Let's set one up:"
+      hint "1. Go to: https://console.cloud.google.com/billing/create"
+      hint "2. Follow the prompts to add a payment method"
+      hint "3. Come back here when you're done"
+      echo ""
+      read -rp "  Press Enter when you've created a billing account..."
+
+      # Re-check
+      BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+      if [ -z "$BILLING_ACCOUNTS" ]; then
+        fail "Still no billing account found."
+        hint "Go to https://console.cloud.google.com/billing/create and try again,"
+        hint "then re-run: make setup"
+        exit 1
+      fi
+      ok "Billing account found"
+    fi
+
+    # ── Create project ──
     SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
     echo ""
     read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
@@ -310,30 +366,16 @@ else
       GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
     done
 
-    info "We need to log in to GCP first to create the project."
-    hint "A browser window will open — sign in with the Google account you"
-    hint "want to use for this project."
-    echo ""
-    gcloud auth login
-    ok "Logged in"
-    GCP_AUTH_DONE=true
-
-    spin "Creating project $GCP_PROJECT" \
-      gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
+    # Idempotent — skip if project already exists (e.g. re-run after partial failure)
+    if gcloud projects describe "$GCP_PROJECT" &>/dev/null 2>&1; then
+      ok "Project $GCP_PROJECT already exists"
+    else
+      spin "Creating project $GCP_PROJECT" \
+        gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
+    fi
     gcloud config set project "$GCP_PROJECT" 2>/dev/null
 
-    # Link billing so Cloud Functions and Cloud Run work
-    echo ""
-    info "Cloud Functions requires billing to be enabled on the project."
-    BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
-
-    if [ -z "$BILLING_ACCOUNTS" ]; then
-      warn "No billing accounts found."
-      hint "Set up billing at: https://console.cloud.google.com/billing"
-      hint "Then link it to project $GCP_PROJECT and re-run this script."
-      exit 1
-    fi
-
+    # ── Link billing ──
     ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
     if [ "$ACCOUNT_COUNT" -eq 1 ]; then
       BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
@@ -355,16 +397,16 @@ else
         gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
     fi
 
-    ok "Project $GCP_PROJECT created with billing enabled"
+    ok "Project $GCP_PROJECT ready with billing enabled"
   fi
 
-  # ── 2. Drive folder ──
+  # ── B) Drive folder ─────────────────────────────────────────────────
   echo ""
   printf "  ${BOLD}B) Google Drive folder${NC}\n"
   hint "Which Drive folder should we watch for changes?"
-  hint "  1. Open Google Drive (drive.google.com)"
+  hint "  1. Go to drive.google.com"
   hint "  2. Open the folder you want to sync (or create a new one)"
-  hint "  3. Look at the URL — it looks like:"
+  hint "  3. Look at the URL bar — it'll look like:"
   hint "     drive.google.com/drive/folders/1aBcD_eFgHiJkLmNoPqRsTuVwXyZ"
   hint "You can paste the whole URL or just the ID part after /folders/."
   echo ""
@@ -382,7 +424,7 @@ else
     hint "Open your folder in Drive and copy the URL from the browser address bar"
   done
 
-  # ── 3. Git repo ──
+  # ── C) Git repository ───────────────────────────────────────────────
   echo ""
   printf "  ${BOLD}C) Git repository${NC}\n"
   hint "This is where synced files get pushed as git commits."
@@ -401,11 +443,16 @@ else
       hint "Example: https://github.com/yourname/your-repo.git"
     done
   else
-    # Check if gh CLI is available for GitHub repo creation
+    # Check if gh CLI is available
     if command -v gh &>/dev/null; then
       GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      if [ -z "$GH_USER" ]; then
+        info "GitHub CLI is installed but not logged in. Let's fix that."
+        gh auth login
+        GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      fi
       if [ -n "$GH_USER" ]; then
-        hint "We can create a GitHub repo for you (logged in as @$GH_USER)."
+        hint "We'll create a GitHub repo for you (logged in as @$GH_USER)."
         SUGGESTED_REPO="drive-sync"
         echo ""
         read -rp "  Repo name [$SUGGESTED_REPO]: " REPO_NAME
@@ -420,10 +467,8 @@ else
         GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
         ok "Created $GIT_REPO_URL"
       else
-        hint "gh CLI found but not logged in. Run: gh auth login"
-        hint "Or create a repo manually:"
-        hint "  GitHub: https://github.com/new"
-        hint "  GitLab: https://gitlab.com/projects/new"
+        fail "Couldn't detect GitHub user. Let's enter the repo URL manually."
+        hint "Create a repo at https://github.com/new, then paste the HTTPS URL."
         echo ""
         while true; do
           read -rp "  Repo URL: " GIT_REPO_URL
@@ -432,8 +477,7 @@ else
         done
       fi
     else
-      hint "To create a repo automatically, install the GitHub CLI (gh)."
-      hint "Otherwise, create one manually:"
+      hint "Create a repo on GitHub, GitLab, or any git host:"
       hint "  GitHub: https://github.com/new"
       hint "  GitLab: https://gitlab.com/projects/new"
       hint "Then copy the HTTPS clone URL."
@@ -449,7 +493,7 @@ else
   read -rp "  Branch to push to [main]: " GIT_BRANCH
   GIT_BRANCH="${GIT_BRANCH:-main}"
 
-  # ── 4. Git token ──
+  # ── D) Git personal access token ────────────────────────────────────
   echo ""
   printf "  ${BOLD}D) Git personal access token${NC}\n"
   hint "The bot needs a token to push commits to your repo."
@@ -463,7 +507,7 @@ else
     hint "     (or: profile icon → Settings → Developer Settings → Fine-grained tokens)"
     hint "  2. Click \"Generate new token\""
     hint "  3. Name it anything (e.g. \"drive-sync-bot\")"
-    hint "  4. Under \"Repository access\" → select \"Only select repositories\""
+    hint "  4. Under \"Repository access\" → \"Only select repositories\""
     hint "     and pick your repo"
     hint "  5. Under \"Permissions\" → \"Repository permissions\" →"
     hint "     set \"Contents\" to \"Read and write\""
@@ -491,6 +535,40 @@ else
     if [ -n "$GIT_TOKEN_VALUE" ]; then break; fi
     fail "Token can't be empty"
   done
+
+  # Quick validation — check if the token can access the repo
+  if [[ "$GIT_REPO_URL" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+    OWNER="${BASH_REMATCH[1]}"
+    REPO="${BASH_REMATCH[2]%.git}"
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: token $GIT_TOKEN_VALUE" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$OWNER/$REPO" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+      ok "Token verified — has access to $OWNER/$REPO"
+    elif [ "$HTTP_CODE" = "000" ]; then
+      hint "Couldn't reach GitHub API to verify (no internet?). Continuing anyway."
+    else
+      warn "Token might not have access to $OWNER/$REPO (HTTP $HTTP_CODE)"
+      hint "Make sure it has Contents (read/write) permission on the repo."
+      read -rp "  Continue anyway? [Y/n]: " CONTINUE
+      [[ "${CONTINUE:-Y}" =~ ^[Nn] ]] && exit 1
+    fi
+  elif [[ "$GIT_REPO_URL" =~ gitlab\.com[:/](.+) ]]; then
+    GL_PATH="${BASH_REMATCH[1]%.git}"
+    GL_PATH="${GL_PATH%/}"
+    GL_ENCODED=$(echo "$GL_PATH" | sed 's/\//%2F/g')
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "PRIVATE-TOKEN: $GIT_TOKEN_VALUE" \
+      "https://gitlab.com/api/v4/projects/$GL_ENCODED" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+      ok "Token verified — has access to $GL_PATH"
+    elif [ "$HTTP_CODE" != "000" ]; then
+      warn "Token might not have access to $GL_PATH (HTTP $HTTP_CODE)"
+      read -rp "  Continue anyway? [Y/n]: " CONTINUE
+      [[ "${CONTINUE:-Y}" =~ ^[Nn] ]] && exit 1
+    fi
+  fi
 
   GIT_TOKEN_SECRET="git-token"
 
@@ -534,7 +612,6 @@ CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(accoun
 ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
 
 if $AUTO; then
-  # Non-interactive: verify auth exists, don't try to open a browser
   if [ -n "$CURRENT_ACCOUNT" ]; then
     ok "Authenticated as $CURRENT_ACCOUNT"
   elif [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
@@ -551,24 +628,24 @@ if $AUTO; then
     hint "Run: gcloud auth application-default login"
     exit 1
   fi
+elif $FULL_AUTH_DONE; then
+  # Already did both gcloud auth + ADC during project creation in Phase 2
+  CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
+  ok "Authenticated as $CURRENT_ACCOUNT"
 else
   # Interactive: guide through login if needed
-  if $GCP_AUTH_DONE; then
-    # Already logged in during project creation
-    CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
-    ok "Authenticated as $CURRENT_ACCOUNT"
-  elif [ -n "$CURRENT_ACCOUNT" ]; then
+  if [ -n "$CURRENT_ACCOUNT" ]; then
     ok "Authenticated as $CURRENT_ACCOUNT"
   else
-    info "Opening browser to log in to GCP..."
+    info "Let's log in to Google Cloud. A browser window will open."
+    echo ""
     gcloud auth login
     ok "Logged in"
   fi
-  # Terraform needs application-default credentials (separate from gcloud auth)
   if [ ! -f "$ADC_FILE" ]; then
-    info "Terraform needs its own credentials (one more browser window)..."
+    info "Terraform needs its own credentials (one more browser sign-in)..."
     gcloud auth application-default login
-    ok "Application-default credentials saved"
+    ok "Terraform credentials saved"
   fi
 fi
 
@@ -615,9 +692,8 @@ store_token() {
 HAS_VERSION=$(gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null || true)
 
 if [ -n "$GIT_TOKEN_VALUE" ]; then
-  # Token provided via env var (agent mode) or collected during Phase 2
   store_token "$GIT_TOKEN_VALUE"
-  GIT_TOKEN_VALUE="" # clear from memory
+  GIT_TOKEN_VALUE=""
 elif [ -n "$HAS_VERSION" ]; then
   ok "Git token already in Secret Manager"
 elif $AUTO; then
@@ -648,24 +724,56 @@ phase "4/4" "Almost there — three manual steps remain"
 SYNC_URL=$(terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url 2>/dev/null || echo "<run make deploy first>")
 SETUP_URL=$(terraform -chdir="$ROOT_DIR/infra" output -raw setup_watch_url 2>/dev/null || echo "<run make deploy first>")
 SA_EMAIL=$(terraform -chdir="$ROOT_DIR/infra" output -raw service_account_email 2>/dev/null || echo "<run make deploy first>")
+# Extract just the domain from the sync URL for step 1
+SYNC_DOMAIN=$(echo "$SYNC_URL" | sed -n 's|https://\([^/]*\).*|\1|p')
 
 echo ""
-printf "  ${BOLD}1. Verify your domain${NC} ${DIM}(one-time, required for Drive webhooks)${NC}\n"
-hint "a) Google Search Console → Add Property → URL Prefix"
-hint "   $SYNC_URL"
-hint "b) Choose 'HTML file' verification — the function serves it automatically"
-hint "c) API Console → Domain Verification → Add Domain"
-hint "   https://console.cloud.google.com/apis/credentials/domainverification"
+printf "  ${BOLD}1. Domain verification${NC} ${DIM}(one-time — required for Drive webhooks)${NC}\n"
+echo ""
+hint "Drive won't send notifications to your webhook unless you prove you"
+hint "own the URL. This is a one-time process with two parts:"
+echo ""
+hint "${BOLD}Part A — Prove you own the URL:${NC}"
+hint "  1. Open: https://search.google.com/search-console"
+hint "     (\"Search Console\" is a Google tool for verifying website ownership)"
+hint "  2. Click \"Add property\" (or the dropdown at top-left → \"Add property\")"
+hint "  3. In the popup, choose \"URL prefix\" (right side)"
+hint "  4. Paste this URL:  $SYNC_URL"
+hint "  5. Expand the \"HTML file\" verification method"
+hint "     Your Cloud Function already serves this file automatically —"
+hint "     just click \"Verify.\" It should turn green."
+echo ""
+hint "${BOLD}Part B — Register the domain with GCP:${NC}"
+hint "  1. Open: https://console.cloud.google.com/apis/credentials/domainverification"
+hint "     (GCP Console → APIs & Services → Domain Verification)"
+hint "  2. Click \"Add domain\""
+hint "  3. Enter:  $SYNC_DOMAIN"
+hint "  4. Click \"Add domain\""
+echo ""
+hint "After both parts, Drive webhooks will work with your function."
 
 echo ""
 printf "  ${BOLD}2. Share the Drive folder${NC}\n"
-hint "Open your Drive folder → Share → add with Editor access:"
-hint "$SA_EMAIL"
+echo ""
+hint "The service account needs access to read files from your Drive folder."
+hint "  1. Open your Drive folder in the browser"
+hint "  2. Click \"Share\" (or the share icon)"
+hint "  3. Paste this email:  $SA_EMAIL"
+hint "  4. Set access to \"Editor\""
+hint "  5. Uncheck \"Notify people\" (it's a bot, not a person) and click \"Share\""
 
 echo ""
 printf "  ${BOLD}3. Start watching for changes${NC}\n"
-hint "curl -X POST \"${SETUP_URL}?initial_sync=true\" \\"
-hint "  -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+echo ""
+hint "This tells Drive to start sending notifications when files change."
+hint "Run this command:"
+echo ""
+hint "  curl -X POST \"${SETUP_URL}?initial_sync=true\" \\"
+hint "    -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+echo ""
+hint "You should get a JSON response with \"status\": \"ok\"."
+hint "After this, any file added or edited in the Drive folder will"
+hint "automatically appear in your git repo."
 
 echo ""
 echo -e "  ${GREEN}${BOLD}🎉  Setup complete!${NC}"
@@ -681,6 +789,7 @@ if $AUTO; then
   echo "STEP_1: Domain verification"
   echo "  ACTION: Register webhook URL with Google Search Console and API Console Domain Verification"
   echo "  SYNC_HANDLER_URL: $SYNC_URL"
+  echo "  SYNC_DOMAIN: $SYNC_DOMAIN"
   echo "  SEARCH_CONSOLE: https://search.google.com/search-console"
   echo "  DOMAIN_VERIFICATION: https://console.cloud.google.com/apis/credentials/domainverification"
   echo "  VERIFICATION_METHOD: HTML file (auto-served by the function)"
