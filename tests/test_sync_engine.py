@@ -1568,12 +1568,16 @@ class TestRunSync:
         mock_state.get_file.return_value = None  # both are new files
 
         file_data_alice = _make_file_data(
-            name="alice.docx", md5="aaa",
-            author_name="Alice", author_email="alice@co.com",
+            name="alice.docx",
+            md5="aaa",
+            author_name="Alice",
+            author_email="alice@co.com",
         )
         file_data_bob = _make_file_data(
-            name="bob.docx", md5="bbb",
-            author_name="Bob", author_email="bob@co.com",
+            name="bob.docx",
+            md5="bbb",
+            author_name="Bob",
+            author_email="bob@co.com",
         )
 
         # Drive must return different paths for the two files

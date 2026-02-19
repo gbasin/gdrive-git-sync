@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv run mypy functions/
+      - run: uv run --extra dev mypy functions/
 
   test:
     runs-on: ubuntu-latest
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: Run tests with coverage
-        run: uv run pytest tests/ -v --cov=functions --cov-report=term-missing --cov-fail-under=60
+        run: uv run --extra dev pytest tests/ -v --cov=functions --cov-report=term-missing --cov-fail-under=60
         env:
           GCP_PROJECT: test-project
           DRIVE_FOLDER_ID: test-folder
