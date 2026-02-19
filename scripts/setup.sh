@@ -274,58 +274,108 @@ elif $AUTO; then
   exit 1
 else
   FIRST_RUN=true
-  echo ""
+  info "We need four things. I'll walk you through each one."
 
-  # ── GCP project ID ──
+  # ── 1. GCP project ──
+  echo ""
+  printf "  ${BOLD}A) Google Cloud project${NC}\n"
+  hint "This is where your Cloud Functions, database, and secrets will live."
+  hint "If you don't have a project yet:"
+  hint "  1. Go to https://console.cloud.google.com"
+  hint "  2. Click the project dropdown at the top → \"New Project\""
+  hint "  3. Give it any name (e.g. \"drive-sync\") and create it"
+  hint "  4. Make sure billing is enabled (required for Cloud Functions)"
+  hint "The project ID is the lowercase string shown under the name"
+  hint "(e.g. \"drive-sync-429301\" — NOT the display name)."
+  echo ""
   while true; do
-    read -rp "  GCP project ID: " GCP_PROJECT
+    read -rp "  Project ID: " GCP_PROJECT
     if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
       break
     fi
-    fail "Must be 6-30 chars: lowercase letters, digits, hyphens (e.g. my-cool-project)"
+    fail "Doesn't look right — project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
+    hint "Example: my-project-123456"
   done
 
-  # ── Drive folder ID ──
+  # ── 2. Drive folder ──
+  echo ""
+  printf "  ${BOLD}B) Google Drive folder${NC}\n"
+  hint "Which Drive folder should we watch for changes?"
+  hint "  1. Open the folder in Google Drive"
+  hint "  2. Look at the URL bar — it looks like:"
+  hint "     drive.google.com/drive/folders/1aBcD_eFgHiJkLmNoPqRsTuVwXyZ"
+  hint "You can paste the whole URL or just the ID part after /folders/."
+  echo ""
   while true; do
-    read -rp "  Drive folder ID or URL: " FOLDER_INPUT
-    # Extract ID from URL if user pasted the whole thing
+    read -rp "  Folder ID or URL: " FOLDER_INPUT
     if [[ "$FOLDER_INPUT" =~ /folders/([a-zA-Z0-9_-]+) ]]; then
       DRIVE_FOLDER_ID="${BASH_REMATCH[1]}"
-      hint "Extracted folder ID: $DRIVE_FOLDER_ID"
+      ok "Got it — extracted ID: ${DRIVE_FOLDER_ID:0:20}..."
       break
     elif [[ "$FOLDER_INPUT" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
       DRIVE_FOLDER_ID="$FOLDER_INPUT"
       break
     fi
-    fail "Paste the folder ID or the full Drive folder URL"
+    fail "That doesn't look like a folder ID or Drive URL"
+    hint "Open your folder in Drive and copy the URL from the browser address bar"
   done
 
-  # ── Git repo URL ──
+  # ── 3. Git repo ──
+  echo ""
+  printf "  ${BOLD}C) Git repository${NC}\n"
+  hint "Where should the synced files be pushed? You need a repo on"
+  hint "GitHub, GitLab, Bitbucket, or any host that supports HTTPS push."
+  hint "If you don't have one yet:"
+  hint "  GitHub: github.com/new → create a repo (can be private)"
+  hint "  GitLab: gitlab.com/projects/new"
+  hint "Copy the HTTPS clone URL (e.g. https://github.com/you/my-docs.git)."
+  echo ""
   while true; do
-    read -rp "  Git repo URL (HTTPS): " GIT_REPO_URL
+    read -rp "  Repo URL: " GIT_REPO_URL
     if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
       break
     fi
-    fail "Must start with https:// (e.g. https://github.com/you/repo.git)"
+    fail "Needs to be an HTTPS URL (starts with https://)"
+    hint "Example: https://github.com/yourname/your-repo.git"
   done
 
-  # ── Git branch ──
-  read -rp "  Git branch [main]: " GIT_BRANCH
+  read -rp "  Branch to push to [main]: " GIT_BRANCH
   GIT_BRANCH="${GIT_BRANCH:-main}"
 
-  # ── Secret name ──
-  read -rp "  Secret Manager name for git token [git-token]: " GIT_TOKEN_SECRET
-  GIT_TOKEN_SECRET="${GIT_TOKEN_SECRET:-git-token}"
+  # ── 4. Git token ──
+  echo ""
+  printf "  ${BOLD}D) Git personal access token${NC}\n"
+  hint "The bot needs a token to push commits to your repo."
+  hint "This is stored securely in Google Cloud Secret Manager — never in code."
+  echo ""
 
-  # ── Git token ──
-  echo ""
-  info "Last thing — a personal access token so the bot can push commits."
-  echo ""
-  hint "GitHub → Settings → Developer Settings → Fine-grained tokens"
-  hint "  Permission needed: Contents (read/write) on the target repo"
-  echo ""
-  hint "GitLab → Settings → Access Tokens"
-  hint "  Scope needed: write_repository"
+  # Detect host to give specific instructions
+  if [[ "$GIT_REPO_URL" =~ github\.com ]]; then
+    hint "Since you're using GitHub:"
+    hint "  1. Go to https://github.com/settings/tokens?type=beta"
+    hint "     (Settings → Developer Settings → Fine-grained tokens)"
+    hint "  2. Click \"Generate new token\""
+    hint "  3. Under \"Repository access\" → select \"Only select repositories\""
+    hint "     and pick your repo"
+    hint "  4. Under \"Permissions\" → \"Repository permissions\" →"
+    hint "     set \"Contents\" to \"Read and write\""
+    hint "  5. Click \"Generate token\" and copy it"
+  elif [[ "$GIT_REPO_URL" =~ gitlab\.com ]]; then
+    hint "Since you're using GitLab:"
+    hint "  1. Go to your repo → Settings → Access Tokens"
+    hint "  2. Create a project access token"
+    hint "  3. Scope needed: write_repository"
+    hint "  4. Copy the token"
+  elif [[ "$GIT_REPO_URL" =~ bitbucket\.org ]]; then
+    hint "Since you're using Bitbucket:"
+    hint "  1. Go to your repo → Repository settings → Access tokens"
+    hint "  2. Create a token with \"Repositories: Write\" permission"
+    hint "  3. Copy the token"
+  else
+    hint "Create a personal access token with push (write) access to your repo."
+    hint "Check your git host's docs for how to generate one."
+  fi
+
   echo ""
   while true; do
     read -rsp "  Paste your token (input is hidden): " GIT_TOKEN_VALUE
@@ -333,6 +383,8 @@ else
     if [ -n "$GIT_TOKEN_VALUE" ]; then break; fi
     fail "Token can't be empty"
   done
+
+  GIT_TOKEN_SECRET="git-token"
 
   # ── Write .env ──
   cat > "$ENV_FILE" <<EOF
