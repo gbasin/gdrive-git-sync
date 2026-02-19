@@ -3,11 +3,31 @@ set -euo pipefail
 
 # Interactive setup for gdrive-git-sync
 # Idempotent — safe to re-run at any point.
+#
+# Usage:
+#   ./scripts/setup.sh                  # Interactive (guided prompts)
+#   ./scripts/setup.sh --non-interactive # Agent/CI mode (no prompts, uses .env)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="$ROOT_DIR/.env"
 TFVARS_FILE="$ROOT_DIR/infra/terraform.tfvars"
+
+# ── Flags ────────────────────────────────────────────────────────────
+AUTO=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive|--auto|--ci) AUTO=true; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--non-interactive]"
+      echo ""
+      echo "  --non-interactive  Agent/CI mode: no prompts, auto-installs prereqs,"
+      echo "                     requires .env to exist, accepts GIT_TOKEN_VALUE env var."
+      exit 0
+      ;;
+    *) echo "Unknown flag: $1 (try --help)"; exit 1 ;;
+  esac
+done
 
 # ── Colors & helpers ─────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -16,6 +36,7 @@ BLUE='\033[0;34m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 ok()   { printf "  ${GREEN}✔${NC} %s\n" "$*"; }
 fail() { printf "  ${RED}✘${NC} %s\n" "$*"; }
 info() { printf "  ${BLUE}▸${NC} %s\n" "$*"; }
+warn() { printf "  ${YELLOW}!${NC} %s\n" "$*"; }
 hint() { printf "    ${DIM}%s${NC}\n" "$*"; }
 
 phase() {
@@ -23,8 +44,19 @@ phase() {
   printf "${BOLD}[$1] $2${NC}\n"
 }
 
+# Prompt helper — in auto mode, uses default; in interactive mode, asks.
+ask() {
+  local prompt="$1" default="${2:-}" var_name="$3"
+  if $AUTO; then
+    printf -v "$var_name" '%s' "$default"
+    return
+  fi
+  local input
+  read -rp "  $prompt" input
+  printf -v "$var_name" '%s' "${input:-$default}"
+}
+
 # Spinner — runs a command in the background, shows elapsed time.
-# On success: ✔ message (Xs). On failure: ✘ message + last 20 lines.
 spin() {
   local msg="$1"; shift
   local logfile; logfile=$(mktemp)
@@ -70,6 +102,7 @@ trap 'echo ""; echo "  Interrupted."; exit 130' INT
 echo ""
 echo -e "${BOLD}  🔄  gdrive-git-sync setup${NC}"
 echo -e "  ${DIM}Automatically version-control Drive files in git${NC}"
+$AUTO && echo -e "  ${DIM}Running in non-interactive mode${NC}"
 echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -77,23 +110,146 @@ echo ""
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 phase "1/4" "Prerequisites"
 
-MISSING=0
+# Detect package manager
+PKG_MGR=""
+if command -v brew &>/dev/null; then
+  PKG_MGR="brew"
+elif command -v apt-get &>/dev/null; then
+  PKG_MGR="apt"
+fi
+
+# Map tools → install commands
+brew_pkg() {
+  case "$1" in
+    gcloud)    echo "--cask google-cloud-sdk" ;;
+    terraform) echo "hashicorp/tap/terraform" ;;
+    git)       echo "git" ;;
+    zip)       echo "zip" ;;
+  esac
+}
+
+apt_pkg() {
+  case "$1" in
+    gcloud)    echo "" ;;  # no simple apt package
+    terraform) echo "" ;;  # no simple apt package
+    git)       echo "git" ;;
+    zip)       echo "zip" ;;
+  esac
+}
+
+install_url() {
+  case "$1" in
+    gcloud)    echo "https://cloud.google.com/sdk/docs/install" ;;
+    terraform) echo "https://developer.hashicorp.com/terraform/install" ;;
+    git)       echo "https://git-scm.com/downloads" ;;
+    zip)       echo "your system package manager" ;;
+  esac
+}
+
+# Check what's missing
+MISSING_TOOLS=()
 for cmd in gcloud terraform git zip; do
   if command -v "$cmd" &>/dev/null; then
     ok "$cmd"
   else
     fail "$cmd — not found"
-    case "$cmd" in
-      gcloud)    hint "https://cloud.google.com/sdk/docs/install" ;;
-      terraform) hint "https://developer.hashicorp.com/terraform/install" ;;
-      git)       hint "https://git-scm.com/downloads" ;;
-      zip)       hint "brew install zip  (macOS)  or  apt install zip  (Linux)" ;;
-    esac
-    MISSING=1
+    MISSING_TOOLS+=("$cmd")
   fi
 done
 
-[ "$MISSING" -eq 1 ] && { fail "Install the tools above, then re-run."; exit 1; }
+# Install missing tools
+if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+  echo ""
+
+  # Determine what we can auto-install
+  CAN_INSTALL=()
+  MANUAL_INSTALL=()
+  for cmd in "${MISSING_TOOLS[@]}"; do
+    if [ "$PKG_MGR" = "brew" ]; then
+      CAN_INSTALL+=("$cmd")
+    elif [ "$PKG_MGR" = "apt" ] && [ -n "$(apt_pkg "$cmd")" ]; then
+      CAN_INSTALL+=("$cmd")
+    else
+      MANUAL_INSTALL+=("$cmd")
+    fi
+  done
+
+  # Install what we can
+  if [ ${#CAN_INSTALL[@]} -gt 0 ]; then
+    INSTALL_LIST=$(printf ", %s" "${CAN_INSTALL[@]}"); INSTALL_LIST=${INSTALL_LIST:2}
+
+    DO_INSTALL=false
+    if $AUTO; then
+      info "Auto-installing: $INSTALL_LIST"
+      DO_INSTALL=true
+    else
+      read -rp "  Install $INSTALL_LIST with $PKG_MGR? [Y/n]: " ANSWER
+      [[ ! "${ANSWER:-Y}" =~ ^[Nn] ]] && DO_INSTALL=true
+    fi
+
+    if $DO_INSTALL; then
+      # Tap hashicorp if we need terraform via brew
+      if [ "$PKG_MGR" = "brew" ]; then
+        for cmd in "${CAN_INSTALL[@]}"; do
+          if [ "$cmd" = "terraform" ]; then
+            spin "Adding hashicorp/tap to brew" brew tap hashicorp/tap
+            break
+          fi
+        done
+      fi
+
+      for cmd in "${CAN_INSTALL[@]}"; do
+        if [ "$PKG_MGR" = "brew" ]; then
+          spin "Installing $cmd" brew install $(brew_pkg "$cmd")
+        elif [ "$PKG_MGR" = "apt" ]; then
+          spin "Installing $cmd" sudo apt-get install -y $(apt_pkg "$cmd")
+        fi
+      done
+
+      # Verify installations
+      for cmd in "${CAN_INSTALL[@]}"; do
+        if command -v "$cmd" &>/dev/null; then
+          ok "$cmd installed"
+        else
+          # gcloud via brew cask may need PATH sourcing
+          if [ "$cmd" = "gcloud" ] && [ "$PKG_MGR" = "brew" ]; then
+            GCLOUD_PATH="$(brew --prefix)/share/google-cloud-sdk"
+            if [ -f "$GCLOUD_PATH/path.bash.inc" ]; then
+              # shellcheck disable=SC1091
+              source "$GCLOUD_PATH/path.bash.inc"
+            fi
+            if command -v gcloud &>/dev/null; then
+              ok "$cmd installed (sourced PATH from brew)"
+            else
+              fail "$cmd installed but not in PATH — restart your terminal and re-run"
+              exit 1
+            fi
+          else
+            fail "$cmd install succeeded but command not found — restart your terminal and re-run"
+            exit 1
+          fi
+        fi
+      done
+    else
+      for cmd in "${CAN_INSTALL[@]}"; do
+        hint "Install manually: $(install_url "$cmd")"
+      done
+      fail "Install missing tools, then re-run."
+      exit 1
+    fi
+  fi
+
+  # Report anything we couldn't auto-install
+  if [ ${#MANUAL_INSTALL[@]} -gt 0 ]; then
+    echo ""
+    fail "These tools can't be auto-installed on this system:"
+    for cmd in "${MANUAL_INSTALL[@]}"; do
+      hint "$cmd → $(install_url "$cmd")"
+    done
+    fail "Install them manually, then re-run."
+    exit 1
+  fi
+fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Phase 2 — Configuration
@@ -101,7 +257,7 @@ done
 phase "2/4" "Configuration"
 
 FIRST_RUN=false
-GIT_TOKEN_VALUE=""
+GIT_TOKEN_VALUE="${GIT_TOKEN_VALUE:-}"  # accept from env for agent mode
 
 if [ -f "$ENV_FILE" ]; then
   ok "Using existing .env"
@@ -111,6 +267,11 @@ if [ -f "$ENV_FILE" ]; then
   set +a
   hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
   hint "To change settings, edit .env and re-run."
+elif $AUTO; then
+  fail ".env not found. In non-interactive mode, .env must exist."
+  hint "Create it from the example:  cp .env.example .env"
+  hint "Then fill in the values and re-run."
+  exit 1
 else
   FIRST_RUN=true
   echo ""
@@ -210,21 +371,43 @@ phase "3/4" "Setting up GCP"
 
 # ── Auth ──
 CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
-if [ -n "$CURRENT_ACCOUNT" ]; then
-  ok "Authenticated as $CURRENT_ACCOUNT"
-  ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
-  if [ ! -f "$ADC_FILE" ]; then
-    info "Terraform needs application-default credentials..."
+ADC_FILE="${CLOUDSDK_CONFIG_DIR:-$HOME/.config/gcloud}/application_default_credentials.json"
+
+if $AUTO; then
+  # Non-interactive: verify auth exists, don't try to open a browser
+  if [ -n "$CURRENT_ACCOUNT" ]; then
+    ok "Authenticated as $CURRENT_ACCOUNT"
+  elif [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    ok "Using service account from GOOGLE_APPLICATION_CREDENTIALS"
+  else
+    fail "No GCP authentication found."
+    hint "Before running in non-interactive mode, authenticate with one of:"
+    hint "  gcloud auth login && gcloud auth application-default login"
+    hint "  export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json"
+    exit 1
+  fi
+  if [ ! -f "$ADC_FILE" ] && [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    fail "Terraform needs application-default credentials."
+    hint "Run: gcloud auth application-default login"
+    exit 1
+  fi
+else
+  # Interactive: guide through login if needed
+  if [ -n "$CURRENT_ACCOUNT" ]; then
+    ok "Authenticated as $CURRENT_ACCOUNT"
+    if [ ! -f "$ADC_FILE" ]; then
+      info "Terraform needs application-default credentials..."
+      gcloud auth application-default login
+      ok "Application-default credentials saved"
+    fi
+  else
+    info "Opening browser to log in to GCP..."
+    gcloud auth login
+    ok "Logged in"
+    info "One more — Terraform needs its own credentials..."
     gcloud auth application-default login
     ok "Application-default credentials saved"
   fi
-else
-  info "Opening browser to log in to GCP..."
-  gcloud auth login
-  ok "Logged in"
-  info "One more — Terraform needs its own credentials..."
-  gcloud auth application-default login
-  ok "Application-default credentials saved"
 fi
 
 gcloud config set project "$GCP_PROJECT" 2>/dev/null
@@ -257,16 +440,28 @@ spin "Deploying infrastructure (this one takes a while)" \
 
 # ── Git token ──
 SECRET_NAME="${GIT_TOKEN_SECRET:-git-token}"
-if [ -n "$GIT_TOKEN_VALUE" ]; then
-  # First run — store the token we collected earlier
-  TMPTOKEN=$(mktemp)
-  printf '%s' "$GIT_TOKEN_VALUE" > "$TMPTOKEN"
+
+store_token() {
+  local token_val="$1"
+  local tmpfile; tmpfile=$(mktemp)
+  printf '%s' "$token_val" > "$tmpfile"
   spin "Storing git token in Secret Manager" \
-    gcloud secrets versions add "$SECRET_NAME" --data-file="$TMPTOKEN"
-  rm -f "$TMPTOKEN"
+    gcloud secrets versions add "$SECRET_NAME" --data-file="$tmpfile"
+  rm -f "$tmpfile"
+}
+
+HAS_VERSION=$(gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null || true)
+
+if [ -n "$GIT_TOKEN_VALUE" ]; then
+  # Token provided via env var (agent mode) or collected during Phase 2
+  store_token "$GIT_TOKEN_VALUE"
   GIT_TOKEN_VALUE="" # clear from memory
-elif gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null | grep -q .; then
+elif [ -n "$HAS_VERSION" ]; then
   ok "Git token already in Secret Manager"
+elif $AUTO; then
+  warn "No git token found in Secret Manager and none provided."
+  hint "Set GIT_TOKEN_VALUE env var and re-run, or add manually:"
+  hint "  echo -n 'YOUR_TOKEN' | gcloud secrets versions add $SECRET_NAME --data-file=-"
 else
   echo ""
   info "No git token found in Secret Manager."
@@ -279,11 +474,7 @@ else
     if [ -n "$GIT_TOKEN_VALUE" ]; then break; fi
     fail "Token can't be empty"
   done
-  TMPTOKEN=$(mktemp)
-  printf '%s' "$GIT_TOKEN_VALUE" > "$TMPTOKEN"
-  spin "Storing git token" \
-    gcloud secrets versions add "$SECRET_NAME" --data-file="$TMPTOKEN"
-  rm -f "$TMPTOKEN"
+  store_token "$GIT_TOKEN_VALUE"
   GIT_TOKEN_VALUE=""
 fi
 
@@ -318,3 +509,34 @@ echo ""
 echo -e "  ${GREEN}${BOLD}🎉  Setup complete!${NC}"
 echo -e "  ${DIM}After the three steps above, files will sync automatically.${NC}"
 echo ""
+
+# ── Machine-readable summary for agent mode ──
+if $AUTO; then
+  echo "--- AGENT SUMMARY ---"
+  echo "STATUS: success"
+  echo "MANUAL_STEPS_REQUIRED: 3"
+  echo ""
+  echo "STEP_1: Domain verification"
+  echo "  ACTION: Register webhook URL with Google Search Console and API Console Domain Verification"
+  echo "  SYNC_HANDLER_URL: $SYNC_URL"
+  echo "  SEARCH_CONSOLE: https://search.google.com/search-console"
+  echo "  DOMAIN_VERIFICATION: https://console.cloud.google.com/apis/credentials/domainverification"
+  echo "  VERIFICATION_METHOD: HTML file (auto-served by the function)"
+  echo ""
+  echo "STEP_2: Share Drive folder"
+  echo "  ACTION: Share the monitored Drive folder with the service account"
+  echo "  SERVICE_ACCOUNT: $SA_EMAIL"
+  echo "  ACCESS_LEVEL: Editor"
+  echo ""
+  echo "STEP_3: Initialize watch channel"
+  echo "  ACTION: Send POST request to start watching for Drive changes"
+  echo "  COMMAND: curl -X POST \"${SETUP_URL}?initial_sync=true\" -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+  echo ""
+  if [ -z "$HAS_VERSION" ] && [ -z "${GIT_TOKEN_VALUE:-}" ]; then
+    echo "WARNING: Git token not stored in Secret Manager."
+    echo "  ACTION: Store token before initializing watch"
+    echo "  COMMAND: echo -n 'YOUR_TOKEN' | gcloud secrets versions add $SECRET_NAME --data-file=-"
+    echo ""
+  fi
+  echo "--- END AGENT SUMMARY ---"
+fi

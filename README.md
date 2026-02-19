@@ -55,7 +55,7 @@ docs/
 - Google Drive folder to monitor
 - Git repository (any host supporting HTTPS push)
 - Personal access token for git push
-- `gcloud`, `terraform`, and `git` CLI tools
+- `gcloud`, `terraform`, and `git` CLI tools (setup will offer to install these via brew)
 
 ## Setup
 
@@ -65,7 +65,16 @@ The interactive setup script walks you through everything:
 make setup
 ```
 
-This checks prerequisites, creates your `.env`, authenticates with GCP, enables APIs, deploys infrastructure, and stores your git token — all in one guided flow. It's idempotent, so you can re-run it safely.
+This checks prerequisites (installing missing tools via brew), creates your `.env`, authenticates with GCP, enables APIs, deploys infrastructure, and stores your git token — all in one guided flow. It's idempotent, so you can re-run it safely.
+
+**Non-interactive / agent mode** — for CI or AI-agent-driven setup:
+
+```bash
+cp .env.example .env   # fill in values first
+GIT_TOKEN_VALUE=ghp_xxx ./scripts/setup.sh --non-interactive
+```
+
+Requires `.env` and GCP auth to exist beforehand. Auto-installs missing tools, prints a machine-readable summary of remaining manual steps.
 
 To redeploy after code changes:
 
