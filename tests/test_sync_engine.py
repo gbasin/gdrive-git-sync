@@ -3,7 +3,7 @@
 DriveClient, StateManager, and GitRepo are mocked throughout.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -759,3 +759,568 @@ class TestResyncLoop:
         # Classify the deduped change
         result = classify_change("f1", deduped["f1"], mock_drive, mock_state)
         assert result.change_type == ChangeType.MODIFY
+
+
+# ---------------------------------------------------------------------------
+# _handle_delete
+# ---------------------------------------------------------------------------
+
+
+class TestHandleDelete:
+    """Tests for deleting files from the repo."""
+
+    def test_deletes_original_file(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_delete
+
+        mock_state.get_file.return_value = {"path": "Reports/old.docx", "extracted_path": None}
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/old.docx")
+
+        _handle_delete(change, mock_repo, mock_state, "docs")
+        mock_repo.delete_file.assert_called_once_with("docs/Reports/old.docx")
+
+    def test_deletes_extracted_file_too(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_delete
+
+        mock_state.get_file.return_value = {
+            "path": "Reports/doc.docx",
+            "extracted_path": "Reports/doc.docx.md",
+        }
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/doc.docx")
+
+        _handle_delete(change, mock_repo, mock_state, "docs")
+        calls = mock_repo.delete_file.call_args_list
+        assert call("docs/Reports/doc.docx") in calls
+        assert call("docs/Reports/doc.docx.md") in calls
+
+    def test_no_old_path_does_nothing(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_delete
+
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path=None)
+
+        _handle_delete(change, mock_repo, mock_state, "docs")
+        mock_repo.delete_file.assert_not_called()
+
+    def test_no_extracted_path_only_deletes_original(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_delete
+
+        mock_state.get_file.return_value = {"path": "data.csv", "extracted_path": None}
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="data.csv")
+
+        _handle_delete(change, mock_repo, mock_state, "docs")
+        mock_repo.delete_file.assert_called_once_with("docs/data.csv")
+
+
+# ---------------------------------------------------------------------------
+# _handle_rename
+# ---------------------------------------------------------------------------
+
+
+class TestHandleRename:
+    """Tests for renaming/moving files in the repo."""
+
+    def test_renames_original_file(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_state.get_file.return_value = {"path": "old.docx", "extracted_path": None, "md5": "abc123"}
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new.docx", md5="abc123"),
+            old_path="old.docx",
+            new_path="new.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+        mock_repo.rename_file.assert_any_call("docs/old.docx", "docs/new.docx")
+
+    def test_renames_extracted_file_too(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_state.get_file.return_value = {
+            "path": "old.docx",
+            "extracted_path": "old.docx.md",
+            "md5": "abc123",
+        }
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new.docx", md5="abc123"),
+            old_path="old.docx",
+            new_path="new.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+        rename_calls = mock_repo.rename_file.call_args_list
+        assert call("docs/old.docx", "docs/new.docx") in rename_calls
+        assert call("docs/old.docx.md", "docs/new.docx.md") in rename_calls
+
+    def test_move_to_subfolder_renames_extracted_path(self, mock_state):
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_state.get_file.return_value = {
+            "path": "doc.docx",
+            "extracted_path": "doc.docx.md",
+            "md5": "abc123",
+        }
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=_make_file_data(name="doc.docx", md5="abc123"),
+            old_path="doc.docx",
+            new_path="Archive/doc.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+        rename_calls = mock_repo.rename_file.call_args_list
+        assert call("docs/doc.docx", "docs/Archive/doc.docx") in rename_calls
+        assert call("docs/doc.docx.md", "docs/Archive/doc.docx.md") in rename_calls
+
+
+# ---------------------------------------------------------------------------
+# _download_and_extract
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadAndExtract:
+    """Tests for downloading files and extracting text."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        """Side effect for extract_text that creates the output file."""
+        with open(output_path, "w") as f:
+            f.write("extracted content")
+        return True
+
+    @patch("sync_engine.extract_text")
+    def test_binary_docx_downloads_and_extracts(self, mock_extract):
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"fake docx bytes"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(name="report.docx", md5="abc123"),
+            new_path="Reports/report.docx",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # Original file written to repo
+        mock_repo.write_file.assert_any_call("docs/Reports/report.docx", b"fake docx bytes")
+        # download_file called (not export_file)
+        mock_drive.download_file.assert_called_once_with("f1")
+        mock_drive.export_file.assert_not_called()
+        # extract_text called and extracted file written to repo
+        mock_extract.assert_called_once()
+        # Two write_file calls: original + extracted
+        assert mock_repo.write_file.call_count == 2
+
+    @patch("sync_engine.extract_text")
+    def test_google_doc_exports_then_extracts(self, mock_extract):
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_drive = MagicMock()
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(
+                name="My Doc",
+                mime_type="application/vnd.google-apps.document",
+                md5=None,
+            ),
+            new_path="My Doc",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # export_file called with docx MIME type
+        mock_drive.export_file.assert_called_once_with(
+            "f1",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        mock_drive.download_file.assert_not_called()
+        # Original (exported) file written
+        mock_repo.write_file.assert_any_call("docs/My Doc.docx", b"exported docx bytes")
+
+    @patch("sync_engine.extract_text")
+    def test_google_slides_exports_as_pdf(self, mock_extract):
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_drive = MagicMock()
+        mock_drive.export_file.return_value = b"pdf bytes"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(
+                name="Slides Deck",
+                mime_type="application/vnd.google-apps.presentation",
+                md5=None,
+            ),
+            new_path="Slides Deck",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_drive.export_file.assert_called_once_with("f1", "application/pdf")
+        mock_repo.write_file.assert_any_call("docs/Slides Deck.pdf", b"pdf bytes")
+
+    @patch("sync_engine.extract_text")
+    def test_google_sheet_exports_as_csv(self, mock_extract):
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_drive = MagicMock()
+        mock_drive.export_file.return_value = b"csv data"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(
+                name="Budget",
+                mime_type="application/vnd.google-apps.spreadsheet",
+                md5=None,
+            ),
+            new_path="Budget",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_drive.export_file.assert_called_once_with("f1", "text/csv")
+        mock_repo.write_file.assert_any_call("docs/Budget.csv", b"csv data")
+
+    @patch("sync_engine.extract_text")
+    def test_non_extractable_file_only_written(self, mock_extract):
+        """A plain text file should be written but not extracted."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"plain text"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(
+                name="notes.txt",
+                mime_type="text/plain",
+                md5="xyz",
+            ),
+            new_path="notes.txt",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_repo.write_file.assert_called_once_with("docs/notes.txt", b"plain text")
+        mock_extract.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_extraction_failure_does_not_crash(self, mock_extract):
+        """If extraction fails, the original file should still be written."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.return_value = False  # extraction failed
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"corrupt pdf"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(name="bad.pdf", mime_type="application/pdf", md5="xyz"),
+            new_path="bad.pdf",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # Original still written, only one write (no extracted file)
+        mock_repo.write_file.assert_called_once_with("docs/bad.pdf", b"corrupt pdf")
+
+    @patch("sync_engine.extract_text")
+    def test_file_in_subfolder(self, mock_extract):
+        """Extracted file is placed next to original in subfolder."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"data"
+
+        mock_repo = MagicMock()
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(name="report.docx", md5="abc"),
+            new_path="2025/Q1/report.docx",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # Original in subfolder
+        mock_repo.write_file.assert_any_call("docs/2025/Q1/report.docx", b"data")
+        # extract_text called (extracted file would be 2025/Q1/report.docx.md)
+        mock_extract.assert_called_once()
+        # Extracted file also written to repo
+        assert mock_repo.write_file.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# process_changes
+# ---------------------------------------------------------------------------
+
+
+class TestProcessChanges:
+    """Tests for the process_changes orchestrator."""
+
+    def test_processes_add_change(self, mock_state):
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"content"
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=_make_file_data(name="notes.txt", mime_type="text/plain", md5="abc"),
+            new_path="notes.txt",
+        )
+
+        with patch("sync_engine.extract_text") as mock_extract:
+            mock_extract.return_value = False
+            result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+
+        assert len(result) == 1
+        assert result[0].file_id == "f1"
+
+    def test_processes_delete_change(self, mock_state):
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_state.get_file.return_value = {"path": "old.txt", "extracted_path": None}
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.DELETE,
+            old_path="old.txt",
+        )
+
+        result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+        assert len(result) == 1
+        mock_repo.delete_file.assert_called()
+
+    def test_skips_failed_changes(self, mock_state):
+        """If processing one change fails, others still get processed."""
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = [Exception("network error"), b"good content"]
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        changes = [
+            Change(
+                file_id="f1",
+                change_type=ChangeType.ADD,
+                file_data=_make_file_data(name="bad.txt", mime_type="text/plain", md5="a"),
+                new_path="bad.txt",
+            ),
+            Change(
+                file_id="f2",
+                change_type=ChangeType.ADD,
+                file_data=_make_file_data(name="good.txt", mime_type="text/plain", md5="b"),
+                new_path="good.txt",
+            ),
+        ]
+
+        with patch("sync_engine.extract_text") as mock_extract:
+            mock_extract.return_value = False
+            result = process_changes(changes, mock_drive, mock_repo, mock_state, cfg)
+
+        # Only the second change succeeded
+        assert len(result) == 1
+        assert result[0].file_id == "f2"
+
+    def test_processes_rename_change(self, mock_state):
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_state.get_file.return_value = {
+            "path": "old.docx",
+            "extracted_path": "old.docx.md",
+            "md5": "abc123",
+        }
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new.docx", md5="abc123"),
+            old_path="old.docx",
+            new_path="new.docx",
+        )
+
+        result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+        assert len(result) == 1
+        mock_repo.rename_file.assert_called()
+
+    def test_empty_changes_returns_empty(self, mock_state):
+        from sync_engine import process_changes
+
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        result = process_changes([], mock_drive, mock_repo, mock_state, cfg)
+        assert result == []
+
+    def test_modify_change_re_downloads(self, mock_state):
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"updated content"
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MODIFY,
+            file_data=_make_file_data(name="report.docx", md5="new_md5"),
+            new_path="report.docx",
+        )
+
+        def _fake_extract(input_path, output_path, mime_type=None):
+            with open(output_path, "w") as f:
+                f.write("extracted")
+            return True
+
+        with patch("sync_engine.extract_text") as mock_extract:
+            mock_extract.side_effect = _fake_extract
+            result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+
+        assert len(result) == 1
+        mock_drive.download_file.assert_called_once_with("f1")
+
+
+# ---------------------------------------------------------------------------
+# _stage_change_files edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestStageChangeFilesEdgeCases:
+    """Additional edge cases for _stage_change_files."""
+
+    def test_rename_stages_both_old_and_new(self):
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            old_path="Reports/old.docx",
+            new_path="Reports/new.docx",
+            file_data={"name": "new.docx", "mimeType": "application/octet-stream"},
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Reports/old.docx" in stage_calls
+        assert "docs/Reports/new.docx" in stage_calls
+
+    def test_move_stages_both_old_and_new(self):
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            old_path="a/file.txt",
+            new_path="b/file.txt",
+            file_data={"name": "file.txt", "mimeType": "text/plain"},
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/a/file.txt" in stage_calls
+        assert "docs/b/file.txt" in stage_calls
+
+    def test_add_google_doc_stages_exported_and_extracted(self):
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="My Doc",
+            file_data={
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+            },
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/My Doc" in stage_calls
+        assert "docs/My Doc.docx.md" in stage_calls
+
+    def test_add_pdf_stages_original_and_txt(self):
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Reports/invoice.pdf",
+            file_data={
+                "name": "invoice.pdf",
+                "mimeType": "application/pdf",
+            },
+        )
+        _stage_change_files(change, mock_repo, "docs")
+
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Reports/invoice.pdf" in stage_calls
+        assert "docs/Reports/invoice.pdf.txt" in stage_calls

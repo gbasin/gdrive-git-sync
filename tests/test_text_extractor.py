@@ -1,10 +1,14 @@
 """Tests for functions/text_extractor.py."""
 
+import os
 from unittest.mock import MagicMock, patch
 
+import pypandoc
 import pytest
 
 from text_extractor import (
+    EXTRACTABLE,
+    GOOGLE_NATIVE_EXPORTS,
     _format_table,
     extract_csv,
     extract_docx,
@@ -128,8 +132,9 @@ class TestFormatTable:
         rows = [["A", "B", "C"], ["1", "2"]]  # second row is short
         result = _format_table(rows)
         lines = result.strip().split("\n")
-        # Data row should have 3 pipe-delimited cells
-        cells = [c.strip() for c in lines[2].split("|") if c.strip() != ""]
+        # Data row should have 3 pipe-delimited cells (including padded empty one)
+        # Split on | gives ['', ' 1 ', ' 2 ', ' ', ''] — inner elements are cells
+        cells = lines[2].split("|")[1:-1]  # strip leading/trailing empty from split
         assert len(cells) == 3
 
     def test_empty_rows_returns_empty(self):
@@ -220,6 +225,118 @@ class TestExtractPdf:
         assert "Col A" in result
         assert "Some text after table" in result
 
+    @patch("text_extractor.pdfplumber")
+    def test_multiple_tables_on_one_page(self, mock_plumber):
+        """Multiple tables on a single page are all included."""
+        page = MagicMock()
+        page.extract_tables.return_value = [
+            [["T1 A", "T1 B"], ["t1v1", "t1v2"]],
+            [["T2 X", "T2 Y"], ["t2v1", "t2v2"]],
+        ]
+        page.extract_text.return_value = "Body text"
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert "T1 A" in result
+        assert "T2 X" in result
+        assert "Body text" in result
+
+    @patch("text_extractor.pdfplumber")
+    def test_table_only_page_no_warning(self, mock_plumber):
+        """A page with tables but no text should NOT show a scanned-page warning."""
+        page = MagicMock()
+        page.extract_tables.return_value = [
+            [["Header"], ["row1"]],
+        ]
+        page.extract_text.return_value = None  # no body text
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert "Header" in result
+        assert "WARNING" not in result
+        assert "no extractable text" not in result
+
+    @patch("text_extractor.pdfplumber")
+    def test_mixed_pages_some_empty(self, mock_plumber):
+        """Multi-page PDF: page 1 has text, page 2 is empty/scanned."""
+        page1 = MagicMock()
+        page1.extract_tables.return_value = []
+        page1.extract_text.return_value = "Real content"
+
+        page2 = MagicMock()
+        page2.extract_tables.return_value = []
+        page2.extract_text.return_value = None
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page1, page2]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert "Real content" in result
+        assert "WARNING" in result
+        assert "[Page 2: no extractable text" in result
+
+    @patch("text_extractor.pdfplumber")
+    def test_all_empty_pages(self, mock_plumber):
+        """PDF where every page is empty/scanned."""
+        page1 = MagicMock()
+        page1.extract_tables.return_value = []
+        page1.extract_text.return_value = None
+
+        page2 = MagicMock()
+        page2.extract_tables.return_value = []
+        page2.extract_text.return_value = None
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page1, page2]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert "WARNING" in result
+        assert "[Page 1: no extractable text" in result
+        assert "[Page 2: no extractable text" in result
+
+    @patch("text_extractor.pdfplumber")
+    def test_zero_pages(self, mock_plumber):
+        """PDF with no pages at all."""
+        mock_pdf = MagicMock()
+        mock_pdf.pages = []
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert result == ""
+        assert "WARNING" not in result
+
+    @patch("text_extractor.pdfplumber")
+    def test_table_with_none_cells(self, mock_plumber):
+        """Tables from pdfplumber can have None cells."""
+        page = MagicMock()
+        page.extract_tables.return_value = [
+            [["Name", None], [None, "value"]],
+        ]
+        page.extract_text.return_value = None
+
+        mock_pdf = MagicMock()
+        mock_pdf.pages = [page]
+        mock_plumber.open.return_value.__enter__ = MagicMock(return_value=mock_pdf)
+        mock_plumber.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = extract_pdf("dummy.pdf")
+        assert "Name" in result
+        assert "value" in result
+        assert "None" not in result  # None values should be replaced
+
 
 # ---------------------------------------------------------------------------
 # extract_docx (mocked)
@@ -282,3 +399,132 @@ class TestExtractText:
         output = tmp_path / "out.txt"
         result = extract_text(str(tmp_path / "doc.pdf"), str(output))
         assert result is False
+
+    @patch("text_extractor.extract_docx")
+    def test_docx_dispatches_correctly(self, mock_docx, tmp_path):
+        mock_docx.return_value = "# Heading\n\nBody text"
+        output = tmp_path / "out.md"
+        result = extract_text(str(tmp_path / "report.docx"), str(output))
+        assert result is True
+        mock_docx.assert_called_once()
+        assert output.read_text(encoding="utf-8") == "# Heading\n\nBody text"
+
+    @patch("text_extractor.extract_pdf")
+    def test_pdf_dispatches_correctly(self, mock_pdf, tmp_path):
+        mock_pdf.return_value = "Page one content"
+        output = tmp_path / "out.txt"
+        result = extract_text(str(tmp_path / "invoice.pdf"), str(output))
+        assert result is True
+        mock_pdf.assert_called_once()
+        assert output.read_text(encoding="utf-8") == "Page one content"
+
+    @patch("text_extractor.extract_docx")
+    def test_case_insensitive_extension(self, mock_docx, tmp_path):
+        """Extract_text should handle uppercase extensions."""
+        mock_docx.return_value = "content"
+        output = tmp_path / "out.md"
+        result = extract_text(str(tmp_path / "Report.DOCX"), str(output))
+        assert result is True
+
+    @patch("text_extractor.extract_csv")
+    def test_output_file_written_utf8(self, mock_csv, tmp_path):
+        """Output file should be written with UTF-8 encoding."""
+        mock_csv.return_value = "| Ñame | Ünit |\n| --- | --- |\n| café | résumé |"
+        output = tmp_path / "out.txt"
+        result = extract_text(str(tmp_path / "data.csv"), str(output))
+        assert result is True
+        content = output.read_text(encoding="utf-8")
+        assert "café" in content
+        assert "résumé" in content
+
+
+# ---------------------------------------------------------------------------
+# Real DOCX integration tests (round-trip through pypandoc)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDocxIntegration:
+    """Integration tests using real pypandoc to create and extract .docx files."""
+
+    def test_round_trip_heading_and_paragraph(self, tmp_path):
+        """Create a real docx from markdown, extract it back, verify content."""
+        md_source = "# Test Heading\n\nThis is a paragraph with **bold** text.\n"
+        docx_path = str(tmp_path / "test.docx")
+        pypandoc.convert_text(md_source, "docx", format="md", outputfile=docx_path)
+
+        result = extract_docx(docx_path)
+        assert "Test Heading" in result
+        assert "bold" in result
+        assert "paragraph" in result
+
+    def test_round_trip_bullet_list(self, tmp_path):
+        """Bullet lists survive the round trip."""
+        md_source = "Items:\n\n- Apple\n- Banana\n- Cherry\n"
+        docx_path = str(tmp_path / "list.docx")
+        pypandoc.convert_text(md_source, "docx", format="md", outputfile=docx_path)
+
+        result = extract_docx(docx_path)
+        assert "Apple" in result
+        assert "Banana" in result
+        assert "Cherry" in result
+
+    def test_round_trip_table(self, tmp_path):
+        """Tables survive the round trip."""
+        md_source = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n"
+        docx_path = str(tmp_path / "table.docx")
+        pypandoc.convert_text(md_source, "docx", format="md", outputfile=docx_path)
+
+        result = extract_docx(docx_path)
+        assert "Name" in result
+        assert "Alice" in result
+        assert "Bob" in result
+
+    def test_round_trip_unicode(self, tmp_path):
+        """Unicode content survives the round trip."""
+        md_source = "# Résumé\n\nCafé, naïve, über, 日本語\n"
+        docx_path = str(tmp_path / "unicode.docx")
+        pypandoc.convert_text(md_source, "docx", format="md", outputfile=docx_path)
+
+        result = extract_docx(docx_path)
+        assert "Résumé" in result
+        assert "Café" in result or "café" in result.lower()
+        assert "日本語" in result
+
+    def test_extract_text_docx_end_to_end(self, tmp_path):
+        """Full end-to-end: extract_text dispatcher with a real docx."""
+        md_source = "# Hello World\n\nContent here.\n"
+        docx_path = str(tmp_path / "hello.docx")
+        output_path = str(tmp_path / "hello.docx.md")
+        pypandoc.convert_text(md_source, "docx", format="md", outputfile=docx_path)
+
+        result = extract_text(docx_path, output_path)
+        assert result is True
+        assert os.path.exists(output_path)
+        with open(output_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "Hello World" in content
+        assert "Content here" in content
+
+
+# ---------------------------------------------------------------------------
+# Constants coverage
+# ---------------------------------------------------------------------------
+
+
+class TestConstants:
+    """Verify the extraction config maps are complete and consistent."""
+
+    def test_extractable_extensions_all_handled(self):
+        """Every extension in EXTRACTABLE should be handled by extract_text."""
+        for ext in EXTRACTABLE:
+            assert ext in (".docx", ".pdf", ".csv")
+
+    def test_google_native_exports_all_have_extractors(self):
+        """Every Google-native export format should map to an extractable extension."""
+        for mime, (_fmt, ext, _) in GOOGLE_NATIVE_EXPORTS.items():
+            assert ext in EXTRACTABLE, f"{mime} exports to {ext} which has no extractor"
+
+    def test_google_native_exports_have_valid_mime_types(self):
+        """All Google-native MIME types should start with the Google apps prefix."""
+        for mime in GOOGLE_NATIVE_EXPORTS:
+            assert mime.startswith("application/vnd.google-apps.")
