@@ -451,15 +451,26 @@ ENVEOF
 
       if $PROJECT_EXISTS; then
         ok "Project $GCP_PROJECT already exists — reusing it"
+      elif $DRY_RUN; then
+        ok "Would create project $GCP_PROJECT [dry-run]"
       else
         # Run inline (not via spin) so we can catch specific errors like ToS
         CREATE_LOG=$(mktemp)
         CREATE_RC=0
-        printf "\r  ⏳ Creating project %s " "$GCP_PROJECT"
-        gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync" >"$CREATE_LOG" 2>&1 || CREATE_RC=$?
+        CREATE_S=0
+
+        gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync" >"$CREATE_LOG" 2>&1 &
+        CREATE_PID=$!
+
+        while kill -0 "$CREATE_PID" 2>/dev/null; do
+          printf "\r  ⏳ Creating project %s (%ds) " "$GCP_PROJECT" "$CREATE_S"
+          sleep 1
+          CREATE_S=$((CREATE_S + 1))
+        done
+        wait "$CREATE_PID" || CREATE_RC=$?
 
         if [ $CREATE_RC -eq 0 ]; then
-          printf "\r  ${GREEN}✔${NC} Created project: %s          \n" "$GCP_PROJECT"
+          printf "\r  ${GREEN}✔${NC} Created project: %s (%ds)          \n" "$GCP_PROJECT" "$CREATE_S"
         elif grep -q "Terms of Service" "$CREATE_LOG"; then
           printf "\r  ${RED}✘${NC} Couldn't create the project — Google needs you to accept their Terms of Service first.\n"
           echo ""
@@ -467,13 +478,12 @@ ENVEOF
           hint "  1. Open: https://console.cloud.google.com"
           hint "  2. You'll see a Terms of Service prompt — accept it"
           hint "  3. Come back here and re-run: make setup"
-          echo ""
           rm -f "$CREATE_LOG"
           exit 1
         elif grep -q "already in use" "$CREATE_LOG"; then
           printf "\r  ${RED}✘${NC} That project ID is already taken by someone else.\n"
-          rm -f "$CREATE_LOG"
           hint "Try a different name — re-run: make setup"
+          rm -f "$CREATE_LOG"
           exit 1
         else
           printf "\r  ${RED}✘${NC} Creating project failed:\n"
