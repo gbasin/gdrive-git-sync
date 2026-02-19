@@ -257,6 +257,7 @@ fi
 phase "2/4" "Configuration"
 
 FIRST_RUN=false
+GCP_AUTH_DONE=false
 GIT_TOKEN_VALUE="${GIT_TOKEN_VALUE:-}"  # accept from env for agent mode
 
 if [ -f "$ENV_FILE" ]; then
@@ -280,29 +281,90 @@ else
   echo ""
   printf "  ${BOLD}A) Google Cloud project${NC}\n"
   hint "This is where your Cloud Functions, database, and secrets will live."
-  hint "If you don't have a project yet:"
-  hint "  1. Go to https://console.cloud.google.com"
-  hint "  2. Click the project dropdown at the top → \"New Project\""
-  hint "  3. Give it any name (e.g. \"drive-sync\") and create it"
-  hint "  4. Make sure billing is enabled (required for Cloud Functions)"
-  hint "The project ID is the lowercase string shown under the name"
-  hint "(e.g. \"drive-sync-429301\" — NOT the display name)."
   echo ""
-  while true; do
-    read -rp "  Project ID: " GCP_PROJECT
-    if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
-      break
+  read -rp "  Do you already have a GCP project? [y/N]: " HAS_PROJECT
+
+  if [[ "${HAS_PROJECT:-}" =~ ^[Yy] ]]; then
+    hint "The project ID is the lowercase string in the URL or project switcher"
+    hint "(e.g. \"drive-sync-429301\" — NOT the display name)."
+    echo ""
+    while true; do
+      read -rp "  Project ID: " GCP_PROJECT
+      if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+        break
+      fi
+      fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
+      hint "Example: my-project-123456"
+    done
+  else
+    hint "No problem — we'll create one for you."
+    # Generate a suggested project ID
+    SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
+    echo ""
+    read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
+    GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
+
+    while ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; do
+      fail "Project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
+      read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
+      GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
+    done
+
+    info "We need to log in to GCP first to create the project."
+    hint "A browser window will open — sign in with the Google account you"
+    hint "want to use for this project."
+    echo ""
+    gcloud auth login
+    ok "Logged in"
+    GCP_AUTH_DONE=true
+
+    spin "Creating project $GCP_PROJECT" \
+      gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync"
+    gcloud config set project "$GCP_PROJECT" 2>/dev/null
+
+    # Link billing so Cloud Functions and Cloud Run work
+    echo ""
+    info "Cloud Functions requires billing to be enabled on the project."
+    BILLING_ACCOUNTS=$(gcloud billing accounts list --filter=open=true --format="value(name,displayName)" 2>/dev/null || true)
+
+    if [ -z "$BILLING_ACCOUNTS" ]; then
+      warn "No billing accounts found."
+      hint "Set up billing at: https://console.cloud.google.com/billing"
+      hint "Then link it to project $GCP_PROJECT and re-run this script."
+      exit 1
     fi
-    fail "Doesn't look right — project IDs are lowercase letters, digits, and hyphens (6-30 chars)"
-    hint "Example: my-project-123456"
-  done
+
+    ACCOUNT_COUNT=$(echo "$BILLING_ACCOUNTS" | wc -l | tr -d ' ')
+    if [ "$ACCOUNT_COUNT" -eq 1 ]; then
+      BILLING_ID=$(echo "$BILLING_ACCOUNTS" | awk '{print $1}')
+      BILLING_NAME=$(echo "$BILLING_ACCOUNTS" | cut -f2-)
+      spin "Linking billing account ($BILLING_NAME)" \
+        gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+    else
+      info "Multiple billing accounts found:"
+      echo "$BILLING_ACCOUNTS" | awk '{printf "    %d) %s\n", NR, $0}'
+      echo ""
+      while true; do
+        read -rp "  Which one? [1]: " BILLING_CHOICE
+        BILLING_CHOICE="${BILLING_CHOICE:-1}"
+        BILLING_ID=$(echo "$BILLING_ACCOUNTS" | sed -n "${BILLING_CHOICE}p" | awk '{print $1}')
+        if [ -n "$BILLING_ID" ]; then break; fi
+        fail "Enter a number from the list above"
+      done
+      spin "Linking billing account" \
+        gcloud billing projects link "$GCP_PROJECT" --billing-account="$BILLING_ID"
+    fi
+
+    ok "Project $GCP_PROJECT created with billing enabled"
+  fi
 
   # ── 2. Drive folder ──
   echo ""
   printf "  ${BOLD}B) Google Drive folder${NC}\n"
   hint "Which Drive folder should we watch for changes?"
-  hint "  1. Open the folder in Google Drive"
-  hint "  2. Look at the URL bar — it looks like:"
+  hint "  1. Open Google Drive (drive.google.com)"
+  hint "  2. Open the folder you want to sync (or create a new one)"
+  hint "  3. Look at the URL — it looks like:"
   hint "     drive.google.com/drive/folders/1aBcD_eFgHiJkLmNoPqRsTuVwXyZ"
   hint "You can paste the whole URL or just the ID part after /folders/."
   echo ""
@@ -323,21 +385,66 @@ else
   # ── 3. Git repo ──
   echo ""
   printf "  ${BOLD}C) Git repository${NC}\n"
-  hint "Where should the synced files be pushed? You need a repo on"
-  hint "GitHub, GitLab, Bitbucket, or any host that supports HTTPS push."
-  hint "If you don't have one yet:"
-  hint "  GitHub: github.com/new → create a repo (can be private)"
-  hint "  GitLab: gitlab.com/projects/new"
-  hint "Copy the HTTPS clone URL (e.g. https://github.com/you/my-docs.git)."
+  hint "This is where synced files get pushed as git commits."
   echo ""
-  while true; do
-    read -rp "  Repo URL: " GIT_REPO_URL
-    if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
-      break
+  read -rp "  Do you already have a repo for this? [y/N]: " HAS_REPO
+
+  if [[ "${HAS_REPO:-}" =~ ^[Yy] ]]; then
+    hint "Copy the HTTPS clone URL from your repo page."
+    echo ""
+    while true; do
+      read -rp "  Repo URL: " GIT_REPO_URL
+      if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
+        break
+      fi
+      fail "Needs to be an HTTPS URL (starts with https://)"
+      hint "Example: https://github.com/yourname/your-repo.git"
+    done
+  else
+    # Check if gh CLI is available for GitHub repo creation
+    if command -v gh &>/dev/null; then
+      GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      if [ -n "$GH_USER" ]; then
+        hint "We can create a GitHub repo for you (logged in as @$GH_USER)."
+        SUGGESTED_REPO="drive-sync"
+        echo ""
+        read -rp "  Repo name [$SUGGESTED_REPO]: " REPO_NAME
+        REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
+
+        read -rp "  Private repo? [Y/n]: " REPO_PRIVATE
+        PRIVATE_FLAG="--private"
+        [[ "${REPO_PRIVATE:-Y}" =~ ^[Nn] ]] && PRIVATE_FLAG="--public"
+
+        spin "Creating GitHub repo $GH_USER/$REPO_NAME" \
+          gh repo create "$REPO_NAME" $PRIVATE_FLAG --clone=false --description "Drive files version-controlled in git"
+        GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+        ok "Created $GIT_REPO_URL"
+      else
+        hint "gh CLI found but not logged in. Run: gh auth login"
+        hint "Or create a repo manually:"
+        hint "  GitHub: https://github.com/new"
+        hint "  GitLab: https://gitlab.com/projects/new"
+        echo ""
+        while true; do
+          read -rp "  Repo URL: " GIT_REPO_URL
+          if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then break; fi
+          fail "Needs to be an HTTPS URL (starts with https://)"
+        done
+      fi
+    else
+      hint "To create a repo automatically, install the GitHub CLI (gh)."
+      hint "Otherwise, create one manually:"
+      hint "  GitHub: https://github.com/new"
+      hint "  GitLab: https://gitlab.com/projects/new"
+      hint "Then copy the HTTPS clone URL."
+      echo ""
+      while true; do
+        read -rp "  Repo URL: " GIT_REPO_URL
+        if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then break; fi
+        fail "Needs to be an HTTPS URL (starts with https://)"
+      done
     fi
-    fail "Needs to be an HTTPS URL (starts with https://)"
-    hint "Example: https://github.com/yourname/your-repo.git"
-  done
+  fi
 
   read -rp "  Branch to push to [main]: " GIT_BRANCH
   GIT_BRANCH="${GIT_BRANCH:-main}"
@@ -353,13 +460,14 @@ else
   if [[ "$GIT_REPO_URL" =~ github\.com ]]; then
     hint "Since you're using GitHub:"
     hint "  1. Go to https://github.com/settings/tokens?type=beta"
-    hint "     (Settings → Developer Settings → Fine-grained tokens)"
+    hint "     (or: profile icon → Settings → Developer Settings → Fine-grained tokens)"
     hint "  2. Click \"Generate new token\""
-    hint "  3. Under \"Repository access\" → select \"Only select repositories\""
+    hint "  3. Name it anything (e.g. \"drive-sync-bot\")"
+    hint "  4. Under \"Repository access\" → select \"Only select repositories\""
     hint "     and pick your repo"
-    hint "  4. Under \"Permissions\" → \"Repository permissions\" →"
+    hint "  5. Under \"Permissions\" → \"Repository permissions\" →"
     hint "     set \"Contents\" to \"Read and write\""
-    hint "  5. Click \"Generate token\" and copy it"
+    hint "  6. Click \"Generate token\" and copy it"
   elif [[ "$GIT_REPO_URL" =~ gitlab\.com ]]; then
     hint "Since you're using GitLab:"
     hint "  1. Go to your repo → Settings → Access Tokens"
@@ -445,18 +553,20 @@ if $AUTO; then
   fi
 else
   # Interactive: guide through login if needed
-  if [ -n "$CURRENT_ACCOUNT" ]; then
+  if $GCP_AUTH_DONE; then
+    # Already logged in during project creation
+    CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
     ok "Authenticated as $CURRENT_ACCOUNT"
-    if [ ! -f "$ADC_FILE" ]; then
-      info "Terraform needs application-default credentials..."
-      gcloud auth application-default login
-      ok "Application-default credentials saved"
-    fi
+  elif [ -n "$CURRENT_ACCOUNT" ]; then
+    ok "Authenticated as $CURRENT_ACCOUNT"
   else
     info "Opening browser to log in to GCP..."
     gcloud auth login
     ok "Logged in"
-    info "One more — Terraform needs its own credentials..."
+  fi
+  # Terraform needs application-default credentials (separate from gcloud auth)
+  if [ ! -f "$ADC_FILE" ]; then
+    info "Terraform needs its own credentials (one more browser window)..."
     gcloud auth application-default login
     ok "Application-default credentials saved"
   fi
