@@ -387,6 +387,7 @@ class TestExtractText:
         result = extract_text(str(tmp_path / "data.csv"), str(output))
         assert result is True
         mock_csv.assert_called_once()
+        assert output.read_text(encoding="utf-8") == "| A |\n| --- |\n| 1 |"
 
     def test_unknown_extension_returns_false(self, tmp_path):
         output = tmp_path / "out.txt"
@@ -443,6 +444,15 @@ class TestExtractText:
 # ---------------------------------------------------------------------------
 
 
+def _pandoc_available():
+    try:
+        pypandoc.get_pandoc_version()
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _pandoc_available(), reason="pandoc not available")
 class TestExtractDocxIntegration:
     """Integration tests using real pypandoc to create and extract .docx files."""
 

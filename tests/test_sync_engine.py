@@ -813,6 +813,17 @@ class TestHandleDelete:
         _handle_delete(change, mock_repo, mock_state, "docs")
         mock_repo.delete_file.assert_called_once_with("docs/data.csv")
 
+    def test_delete_when_no_state_entry(self, mock_state):
+        """Delete still removes the original even when state has no record."""
+        from sync_engine import Change, ChangeType, _handle_delete
+
+        mock_state.get_file.return_value = None
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="lost.docx")
+
+        _handle_delete(change, mock_repo, mock_state, "docs")
+        mock_repo.delete_file.assert_called_once_with("docs/lost.docx")
+
 
 # ---------------------------------------------------------------------------
 # _handle_rename
@@ -837,7 +848,7 @@ class TestHandleRename:
         )
 
         _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
-        mock_repo.rename_file.assert_any_call("docs/old.docx", "docs/new.docx")
+        mock_repo.rename_file.assert_called_once_with("docs/old.docx", "docs/new.docx")
 
     def test_renames_extracted_file_too(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_rename
@@ -897,7 +908,7 @@ class TestDownloadAndExtract:
     @staticmethod
     def _fake_extract_ok(input_path, output_path, mime_type=None):
         """Side effect for extract_text that creates the output file."""
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write("extracted content")
         return True
 
@@ -1233,7 +1244,7 @@ class TestProcessChanges:
         )
 
         def _fake_extract(input_path, output_path, mime_type=None):
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 f.write("extracted")
             return True
 
@@ -1288,6 +1299,12 @@ class TestStageChangeFilesEdgeCases:
         assert "docs/b/file.txt" in stage_calls
 
     def test_add_google_doc_stages_exported_and_extracted(self):
+        """Stages new_path and extracted file for Google Docs.
+
+        NOTE: This reflects current behavior where new_path="My Doc" is staged,
+        but _download_and_extract writes to "My Doc.docx". The multi-author
+        staging path has a mismatch for Google-native files — tracked separately.
+        """
         from sync_engine import Change, ChangeType, _stage_change_files
 
         mock_repo = MagicMock()
