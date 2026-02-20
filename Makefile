@@ -1,4 +1,4 @@
-.SUFFIXES:            # disable built-in suffix rules (prevents .sh → executable copies)
+MAKEFLAGS += -r       # disable built-in implicit rules (.SUFFIXES: alone doesn't work on Make 3.81)
 .PHONY: install lint lint-shell format typecheck test test-shell ci deploy setup clean lock
 
 install:

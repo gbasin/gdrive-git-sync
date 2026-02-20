@@ -1124,19 +1124,47 @@ elif $AUTO; then
     EXTRA_SCOPES_TOKEN=""
   fi
 else
-  echo ""
-  info "One more sign-in to let me automate the remaining steps."
-  hint "Same account, same browser — just click Accept. This grants"
-  hint "permission to share Drive folders and verify domains on your behalf."
-  echo ""
-  if gcloud auth application-default login \
-    --scopes="openid,email,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/siteverification,https://www.googleapis.com/auth/drive" \
-    2>/dev/null; then
-    gcloud auth application-default set-quota-project "$GCP_PROJECT" 2>/dev/null || true
-    EXTRA_SCOPES_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
-    ok "Permissions granted"
-  else
-    warn "Sign-in was cancelled — I'll print manual instructions instead."
+  # Try existing ADC credentials first — skip re-auth if scopes are already granted.
+  # Network failure here clears the token, triggering re-auth below — acceptable tradeoff.
+  EXTRA_SCOPES_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
+  if [ -n "$EXTRA_SCOPES_TOKEN" ]; then
+    # Test both required scopes: Drive and Site Verification
+    DRIVE_OK=false
+    SITEV_OK=false
+    DRIVE_TEST=$(curl -s "https://www.googleapis.com/drive/v3/about?fields=user" \
+      -H "Authorization: Bearer $EXTRA_SCOPES_TOKEN" \
+      -H "X-Goog-User-Project: $GCP_PROJECT" 2>/dev/null || echo "")
+    if echo "$DRIVE_TEST" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'user' in d" 2>/dev/null; then
+      DRIVE_OK=true
+    fi
+    SITEV_TEST=$(curl -s "https://www.googleapis.com/siteVerification/v1/webResource" \
+      -H "Authorization: Bearer $EXTRA_SCOPES_TOKEN" \
+      -H "X-Goog-User-Project: $GCP_PROJECT" 2>/dev/null || echo "")
+    # Site Verification returns {"items":[]} on success or 403 when scope is missing
+    if ! echo "$SITEV_TEST" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('error',{}).get('code') == 403" 2>/dev/null; then
+      SITEV_OK=true
+    fi
+    if $DRIVE_OK && $SITEV_OK; then
+      ok "Using existing credentials"
+    else
+      EXTRA_SCOPES_TOKEN=""  # insufficient scopes — need re-auth
+    fi
+  fi
+  if [ -z "$EXTRA_SCOPES_TOKEN" ]; then
+    echo ""
+    info "One more sign-in to let me automate the remaining steps."
+    hint "Same account, same browser — just click Accept. This grants"
+    hint "permission to share Drive folders and verify domains on your behalf."
+    echo ""
+    if gcloud auth application-default login \
+      --scopes="openid,email,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/siteverification,https://www.googleapis.com/auth/drive" \
+      2>/dev/null; then
+      gcloud auth application-default set-quota-project "$GCP_PROJECT" 2>/dev/null || true
+      EXTRA_SCOPES_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
+      ok "Permissions granted"
+    else
+      warn "Sign-in was cancelled — I'll print manual instructions instead."
+    fi
   fi
 fi
 
@@ -1364,9 +1392,12 @@ else
     if [ "$WATCH_STATUS" = "ok" ] || [ "$WATCH_STATUS" = "initialized" ]; then
       SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
       ok "Watch channel initialized — Drive sync is active!"
-      if [ -n "$SYNC_COUNT" ] && [ "$SYNC_COUNT" != "0" ]; then
+      if [ -z "$SYNC_COUNT" ]; then
+        warn "Sync could not run — lock may be held or initial_sync was skipped."
+        hint "Wait a few minutes and re-run: make setup"
+      elif [ "$SYNC_COUNT" != "0" ]; then
         ok "Initial sync complete: $SYNC_COUNT files committed to git"
-      elif [ "$SYNC_COUNT" = "0" ]; then
+      else  # SYNC_COUNT = "0"
         FILES_LISTED=$(echo "$WATCH_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('initial_sync_debug',{}).get('files_listed','?'))" 2>/dev/null || echo "?")
         if [ "$FILES_LISTED" = "0" ]; then
           warn "No files visible to the service account in Drive folder."
@@ -1382,13 +1413,17 @@ else
             -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
           printf "\r\033[2K"
           SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
-          if [ -n "$SYNC_COUNT" ] && [ "$SYNC_COUNT" != "0" ]; then
+          if [ -z "$SYNC_COUNT" ]; then
+            warn "Sync lock was held during retry. Wait a few minutes and re-run: make setup"
+          elif [ "$SYNC_COUNT" != "0" ]; then
             ok "Initial sync complete: $SYNC_COUNT files committed to git"
           else
             warn "Sync returned 0 files after reset. Check Cloud Function logs."
           fi
         else
+          # FILES_LISTED is "?" — debug data missing (old function code?) or parse error
           hint "No new files to sync (folder empty or already up-to-date)"
+          hint "Debug: $(echo "$WATCH_RESULT" | head -c 500)"
         fi
       fi
     else
