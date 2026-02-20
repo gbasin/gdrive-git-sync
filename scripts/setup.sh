@@ -303,6 +303,12 @@ if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
   set +a
 
+  # Treat "root" as missing — My Drive root can't be shared with the bot
+  if [ "${DRIVE_FOLDER_ID:-}" = "root" ]; then
+    warn "DRIVE_FOLDER_ID=\"root\" (My Drive) can't be shared with the bot — you'll pick a specific folder."
+    DRIVE_FOLDER_ID=""
+  fi
+
   # Check if .env is complete or partial (from a previous crash)
   if [ -n "${GCP_PROJECT:-}" ] && [ -n "${DRIVE_FOLDER_ID:-}" ] && [ -n "${GIT_REPO_URL:-}" ]; then
     ok "Using existing .env (your saved configuration)"
@@ -649,23 +655,18 @@ ENVEOF
     hint "Which folder in your Google Drive should we watch for changes?"
     hint "Open it in your browser and copy the URL from the address bar."
     hint "It'll look like: drive.google.com/drive/folders/1aBcD..."
-    hint "To sync your entire Drive, paste the My Drive URL or type \"root\"."
     echo ""
     hint "You can paste the full URL — I'll extract the folder ID from it."
     echo ""
     while true; do
       read -rp "  Drive folder URL: " FOLDER_INPUT
       if DRIVE_FOLDER_ID=$(extract_drive_folder_id "$FOLDER_INPUT"); then
-        if [ "$DRIVE_FOLDER_ID" = "root" ]; then
-          ok "Got it — syncing entire My Drive"
-        else
-          ok "Got it: ${DRIVE_FOLDER_ID:0:20}..."
-        fi
+        ok "Got it: ${DRIVE_FOLDER_ID:0:20}..."
         break
       fi
       fail "I couldn't find a folder ID in that."
-      hint "Open drive.google.com, navigate to the folder, and paste the URL"
-      hint "from your browser's address bar. (Or type \"root\" for your entire Drive.)"
+      hint "A specific folder is required (My Drive root can't be shared with the bot)."
+      hint "Open drive.google.com, navigate to the folder, and paste the URL."
     done
     write_env
   else

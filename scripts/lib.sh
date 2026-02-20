@@ -34,14 +34,15 @@ install_url() {
   esac
 }
 
-# Extract a Drive folder ID from a URL, bare ID, or "root" / "my-drive" keyword.
+# Extract a Drive folder ID from a URL or bare ID.
+# Rejects "root" / My Drive URLs — a specific folder is required.
 # Prints the folder ID on success, returns 1 on failure.
 extract_drive_folder_id() {
   local input="$1"
   if [[ "$input" =~ /folders/([a-zA-Z0-9_-]+) ]]; then
     echo "${BASH_REMATCH[1]}"
   elif [[ "$input" =~ my-drive ]] || [[ "$input" == "root" ]]; then
-    echo "root"
+    return 1
   elif [[ "$input" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
     echo "$input"
   else

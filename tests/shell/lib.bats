@@ -83,16 +83,14 @@ setup() {
   assert_output "1aBcDeFgHiJk"
 }
 
-@test "extract_drive_folder_id: my-drive keyword" {
+@test "extract_drive_folder_id: my-drive URL rejected" {
   run extract_drive_folder_id "https://drive.google.com/drive/my-drive"
-  assert_success
-  assert_output "root"
+  assert_failure
 }
 
-@test "extract_drive_folder_id: root keyword" {
+@test "extract_drive_folder_id: root keyword rejected" {
   run extract_drive_folder_id "root"
-  assert_success
-  assert_output "root"
+  assert_failure
 }
 
 @test "extract_drive_folder_id: bare folder ID" {
