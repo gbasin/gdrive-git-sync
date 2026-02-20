@@ -100,6 +100,7 @@ spin() {
       hint "Fix the issue above and re-run: make setup"
       ERROR_HANDLED=true; exit 1
     fi
+    hint "Tip: paste the error above into Claude or ChatGPT for help."
     read -rp "  Retry? [Y/n]: " reply
     if [[ "${reply:-Y}" =~ ^[Nn] ]]; then
       ERROR_HANDLED=true; exit 1
@@ -115,7 +116,12 @@ cleanup() {
   $ERROR_HANDLED && return
   echo ""
   fail "Something went wrong."
-  hint "You can safely re-run this — it picks up where it left off: make setup"
+  hint "Your progress is saved in .env — you can safely re-run: make setup"
+  hint ""
+  hint "Stuck? Paste this into Claude, ChatGPT, or any AI assistant:"
+  hint "  I'm setting up gdrive-git-sync (https://github.com/garybasin/gdrive-git-sync)."
+  hint "  It failed during setup. Here's the error output:"
+  hint "  <paste everything above>"
 }
 trap cleanup EXIT
 trap 'echo ""; echo "  Interrupted."; ERROR_HANDLED=true; exit 130' INT
@@ -324,9 +330,9 @@ if [ -f "$ENV_FILE" ]; then
 
   # Check if .env is complete or partial (from a previous crash)
   if [ -n "${GCP_PROJECT:-}" ] && [ -n "${DRIVE_FOLDER_ID:-}" ] && [ -n "${GIT_REPO_URL:-}" ]; then
-    ok "Using existing .env"
+    ok "Using existing .env (your saved configuration)"
     hint "Project: $GCP_PROJECT  |  Repo: $GIT_REPO_URL"
-    hint "To change settings, edit .env and re-run."
+    hint "To change settings, edit .env in a text editor and re-run."
     ENV_COMPLETE=true
   else
     info "Found partial .env from a previous run — picking up where we left off."
@@ -859,6 +865,7 @@ ENVEOF
   set -a; source "$ENV_FILE"; set +a
   echo ""
   ok "Configuration saved to .env"
+  hint "Your settings live in this file. You can edit it anytime and re-run setup."
 fi
 
 # Validate essentials are present
@@ -1138,6 +1145,17 @@ hint "automatically appear as a commit in your git repo."
 echo ""
 echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
 echo -e "  ${DIM}Complete the three steps above and your files will sync automatically.${NC}"
+echo ""
+hint "Your configuration is saved in .env — edit it anytime and re-run: make setup"
+hint ""
+hint "Need help with the steps above? Paste this into Claude, ChatGPT, or any AI:"
+echo ""
+echo "  I just set up gdrive-git-sync (https://github.com/garybasin/gdrive-git-sync)."
+echo "  I need to complete the manual browser steps. Here are my details:"
+echo "  - Sync URL: $SYNC_URL"
+echo "  - Service account: $SA_EMAIL"
+echo "  - Setup URL: $SETUP_URL"
+echo "  Walk me through each step."
 echo ""
 
 # ── Machine-readable summary for agent mode ──
