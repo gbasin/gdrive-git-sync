@@ -22,6 +22,14 @@ CHANGE_FIELDS = (
 
 FILE_FIELDS = "id,name,parents,mimeType"
 
+# Fields for full file listing (initial sync)
+LIST_FILE_FIELDS = (
+    "id,name,parents,mimeType,md5Checksum,"
+    "modifiedTime,size,lastModifyingUser(displayName,emailAddress)"
+)
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
 
 class DriveClient:
     def __init__(self, service=None):
@@ -68,6 +76,48 @@ class DriveClient:
         """Get the current start page token for changes.list."""
         response = self.service.changes().getStartPageToken().execute()
         return str(response["startPageToken"])
+
+    def list_all_files(self) -> list[dict]:
+        """Recursively list all non-trashed files under the monitored folder.
+
+        Returns a flat list of file dicts (folders excluded) with the same
+        fields the sync pipeline needs.
+        """
+        result: list[dict] = []
+        queue = [self.cfg.drive_folder_id]
+        visited: set[str] = set()
+
+        while queue:
+            folder_id = queue.pop()
+            if folder_id in visited:
+                continue
+            visited.add(folder_id)
+            page_token: str | None = None
+
+            while True:
+                response = (
+                    self.service.files()
+                    .list(
+                        q=f"'{folder_id}' in parents and trashed = false",
+                        fields=f"nextPageToken,files({LIST_FILE_FIELDS})",
+                        pageSize=1000,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+
+                for f in response.get("files", []):
+                    if f.get("mimeType") == FOLDER_MIME:
+                        queue.append(f["id"])
+                    else:
+                        result.append(f)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+        logger.info(f"Listed {len(result)} files in folder tree")
+        return result
 
     def is_in_folder(self, file_data: dict) -> bool:
         """Check if a file is under the monitored folder by walking parents."""

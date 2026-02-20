@@ -72,6 +72,39 @@ class GitRepo:
         )
         logger.info(f"Cloned repo to {self.repo_path}")
 
+    def clone_or_init(self):
+        """Clone the repo, falling back to bare init for empty repos.
+
+        An empty repo (zero commits) has no branches, so
+        ``git clone --branch main`` fails with exit 128.  In that case
+        we clone without ``--branch``/``--filter`` and create the branch
+        ourselves.
+        """
+        auth_url = self._auth_url()
+        try:
+            self._run(
+                ["git", "clone", "--filter=blob:none", "--branch", self.cfg.git_branch, auth_url, self.repo_path],
+                cwd=self.work_dir,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").lower()
+            is_empty_repo = (
+                "remote branch" in stderr
+                or "empty repository" in stderr
+                or "does not have a commit checked out" in stderr
+            )
+            if not is_empty_repo:
+                raise
+            logger.info("Normal clone failed (empty repo), retrying without --branch")
+            if os.path.exists(self.repo_path):
+                shutil.rmtree(self.repo_path)
+            self._run(
+                ["git", "clone", auth_url, self.repo_path],
+                cwd=self.work_dir,
+            )
+            self._run(["git", "checkout", "-b", self.cfg.git_branch])
+        logger.info(f"Cloned repo to {self.repo_path}")
+
     def write_file(self, rel_path: str, content: bytes):
         """Write a file to the repo working tree."""
         full_path = os.path.join(self.repo_path, rel_path)
@@ -125,6 +158,32 @@ class GitRepo:
         """Push all commits to remote."""
         self._run(["git", "push", "origin", self.cfg.git_branch])
         logger.info("Pushed to remote")
+
+    def push_if_ahead(self):
+        """Push only if there are local commits ahead of the remote.
+
+        Safe to call even on an empty repo or when no commits were made —
+        it simply does nothing when there is nothing to push.
+        """
+        try:
+            log_output = self._run(
+                ["git", "log", "--oneline", f"origin/{self.cfg.git_branch}..HEAD"],
+            )
+            if not log_output.strip():
+                logger.info("No new commits to push")
+                return
+        except subprocess.CalledProcessError:
+            # origin/<branch> doesn't exist yet (empty remote) — if we
+            # have *any* local commits we should push them.
+            try:
+                log_output = self._run(["git", "log", "--oneline", "-1"])
+                if not log_output.strip():
+                    logger.info("No commits at all, nothing to push")
+                    return
+            except subprocess.CalledProcessError:
+                logger.info("No commits at all, nothing to push")
+                return
+        self.push()
 
     def commit_and_push(self, author_groups: list[dict]):
         """Create one commit per author group and push once.

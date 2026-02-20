@@ -43,6 +43,114 @@ class AuthorCommit:
     files: list["Change"] = field(default_factory=list)
 
 
+def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
+    """Full folder listing + download for existing Drive files.
+
+    Unlike ``run_sync`` (which uses the delta/changes feed), this walks
+    every file via ``files.list`` so it works even when the change page
+    token was *just* captured (delta is empty).
+
+    Idempotency: each file is compared against Firestore state before
+    downloading.  Binary files are matched on ``md5Checksum``; Google-
+    native files (Docs/Sheets/Slides) are matched on ``modifiedTime``
+    because re-exporting them produces byte-different output even when
+    the content hasn't changed.
+
+    Returns the number of files synced.
+    """
+    cfg = get_config()
+
+    all_files = drive.list_all_files()
+    if not all_files:
+        logger.info("No files found in Drive folder")
+        return 0
+
+    # Build Change objects, skipping files already tracked in Firestore
+    changes: list[Change] = []
+    for file_data in all_files:
+        file_id = file_data["id"]
+
+        # Resolve relative path
+        rel_path = drive.get_file_path(file_data)
+
+        # Apply filters
+        if drive.matches_exclude_pattern(rel_path):
+            logger.debug(f"Excluding {rel_path}")
+            continue
+        skip_reason = drive.should_skip_file(file_data)
+        if skip_reason:
+            logger.info(f"Skipping {rel_path}: {skip_reason}")
+            continue
+
+        # Idempotency: check if already tracked with same content
+        existing = state.get_file(file_id)
+        if existing:
+            md5 = file_data.get("md5Checksum")
+            if md5:
+                if md5 == existing.get("md5"):
+                    continue
+            else:
+                # Google-native file — compare modifiedTime
+                if file_data.get("modifiedTime") == existing.get("modified_time"):
+                    continue
+
+        last_user = file_data.get("lastModifyingUser", {})
+        changes.append(
+            Change(
+                file_id=file_id,
+                change_type=ChangeType.ADD,
+                file_data=file_data,
+                new_path=rel_path,
+                author_name=last_user.get("displayName"),
+                author_email=last_user.get("emailAddress"),
+            )
+        )
+
+    if not changes:
+        logger.info("All files already tracked — nothing to sync")
+        return 0
+
+    logger.info(f"Initial sync: {len(changes)} files to process")
+
+    # Clone (handles empty repos)
+    repo.clone_or_init()
+
+    processed = process_changes(changes, drive, repo, state, cfg)
+
+    if processed:
+        author_groups = group_by_author(processed, cfg)
+
+        # Override commit messages for initial sync
+        for group in author_groups:
+            descriptions = []
+            for change in group.files:
+                descriptions.append(f"  - {change.new_path}")
+            group.message = "Initial sync from Google Drive\n\n" + "\n".join(descriptions)
+
+        if len(author_groups) == 1:
+            group = author_groups[0]
+            if repo.has_staged_changes():
+                repo.commit(group.message, group.author_name, group.author_email)
+        else:
+            repo.unstage_all()
+            for group in author_groups:
+                for change in group.files:
+                    _stage_change_files(change, repo, cfg.docs_subdir)
+                if repo.has_staged_changes():
+                    repo.commit(group.message, group.author_name, group.author_email)
+
+        repo.push_if_ahead()
+
+        # Update Firestore state after push (or after confirming remote
+        # is already up to date).  If push_if_ahead() raises, this loop
+        # is skipped — the next run will re-download and retry.
+        for change in processed:
+            update_file_state(change, state)
+
+    logger.info(f"Initial sync complete: {len(processed)} files committed")
+    return len(processed)
+
+
 def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     """Execute a full sync cycle. Returns number of changes processed."""
     cfg = get_config()

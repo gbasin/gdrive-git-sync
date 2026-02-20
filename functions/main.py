@@ -16,7 +16,7 @@ from flask import Request
 from drive_client import DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
-from sync_engine import run_sync
+from sync_engine import run_initial_sync, run_sync
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -202,14 +202,16 @@ def setup_watch(request: Request):
             "expiration": channel_info["expiration"],
         }
 
-        # Optional initial sync
+        # Optional initial sync — uses full folder listing, not the
+        # delta/changes feed, so it picks up files that already existed
+        # before the page token was captured.
         initial_sync = request.args.get("initial_sync", "false").lower() == "true"
         if initial_sync:
             logger.info("Running initial sync...")
             if state.acquire_lock():
                 repo = GitRepo()
                 try:
-                    count = run_sync(drive, state, repo)
+                    count = run_initial_sync(drive, state, repo)
                     result["initial_sync_count"] = count
                 finally:
                     repo.cleanup()
