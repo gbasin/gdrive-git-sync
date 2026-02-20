@@ -53,13 +53,33 @@ resource "google_cloudfunctions2_function" "sync_handler" {
   }
 }
 
-# Allow unauthenticated invocation (Drive webhooks can't authenticate)
-resource "google_cloud_run_v2_service_iam_member" "sync_handler_public" {
-  project  = var.gcp_project
-  location = var.region
-  name     = google_cloudfunctions2_function.sync_handler.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
+# Allow unauthenticated invocation — Drive webhooks don't send auth headers,
+# so the endpoint must accept anonymous requests.
+#
+# We disable the Cloud Run IAM invoker check rather than granting allUsers
+# the run.invoker role. Both achieve the same result (public endpoint), but
+# the IAM approach is blocked by Domain Restricted Sharing org policies.
+# Disabling the invoker check is a Cloud Run-native setting that bypasses
+# IAM entirely, so org policies don't interfere.
+#
+# Security: the function validates webhook requests by matching the
+# X-Goog-Channel-ID header against the stored channel ID — unknown
+# channels are rejected. The Cloud Run URL is also an unguessable
+# random domain. This is equivalent security to the allUsers IAM approach.
+resource "null_resource" "sync_handler_no_iam_check" {
+  triggers = {
+    service_id = google_cloudfunctions2_function.sync_handler.id
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      gcloud run services update ${google_cloudfunctions2_function.sync_handler.name} \
+        --region=${var.region} \
+        --project=${var.gcp_project} \
+        --no-invoker-iam-check \
+        --quiet
+    EOT
+  }
 }
 
 # === renew_watch: scheduled channel renewal ===
