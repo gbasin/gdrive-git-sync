@@ -732,7 +732,40 @@ ENVEOF
           GH_USER=$(gh api user --jq .login 2>/dev/null || true)
         fi
         if [ -n "$GH_USER" ]; then
-          info "I'll create a GitHub repo for you (logged in as @$GH_USER)."
+          # Check for org memberships
+          GH_ORGS=$(gh api user/orgs --jq '.[].login' 2>/dev/null || true)
+          GH_OWNER="$GH_USER"
+          if [ -n "$GH_ORGS" ]; then
+            echo ""
+            info "Where should the repo live?"
+            echo "    1) $GH_USER (personal)"
+            ORG_NUM=2
+            while IFS= read -r org; do
+              [ -z "$org" ] && continue
+              echo "    $ORG_NUM) $org"
+              ORG_NUM=$((ORG_NUM + 1))
+            done <<< "$GH_ORGS"
+            echo ""
+            read -rp "  Pick a number [1]: " OWNER_CHOICE
+            OWNER_CHOICE="${OWNER_CHOICE:-1}"
+            if ! [[ "$OWNER_CHOICE" =~ ^[0-9]+$ ]] || [ "$OWNER_CHOICE" -lt 1 ]; then
+              fail "Invalid input — using personal account ($GH_USER)"
+              OWNER_CHOICE=1
+            fi
+            if [ "$OWNER_CHOICE" -gt 1 ]; then
+              GH_OWNER=$(echo "$GH_ORGS" | sed -n "$((OWNER_CHOICE - 1))p")
+              if [ -z "$GH_OWNER" ]; then
+                fail "Number out of range — using personal account ($GH_USER)"
+                GH_OWNER="$GH_USER"
+              fi
+            fi
+          fi
+
+          if [ "$GH_OWNER" = "$GH_USER" ]; then
+            info "I'll create a GitHub repo for you (logged in as @$GH_USER)."
+          else
+            info "I'll create a GitHub repo under $GH_OWNER."
+          fi
           SUGGESTED_REPO="drive-sync"
           echo ""
           hint "What should the repo be called? Press Enter for \"$SUGGESTED_REPO\"."
@@ -740,13 +773,18 @@ ENVEOF
           REPO_NAME="${REPO_NAME:-$SUGGESTED_REPO}"
 
           # Idempotent — skip if repo already exists (e.g. re-run after crash)
-          if gh repo view "$GH_USER/$REPO_NAME" &>/dev/null; then
-            GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+          if gh repo view "$GH_OWNER/$REPO_NAME" &>/dev/null; then
+            GIT_REPO_URL="https://github.com/$GH_OWNER/$REPO_NAME.git"
             ok "Repo already exists: $GIT_REPO_URL"
           else
-            spin "Creating private repo $GH_USER/$REPO_NAME" \
-              gh repo create "$REPO_NAME" --private --clone=false --description "Drive files version-controlled in git"
-            GIT_REPO_URL="https://github.com/$GH_USER/$REPO_NAME.git"
+            if [ "$GH_OWNER" = "$GH_USER" ]; then
+              spin "Creating private repo $GH_OWNER/$REPO_NAME" \
+                gh repo create "$REPO_NAME" --private --clone=false --description "Drive files version-controlled in git"
+            else
+              spin "Creating private repo $GH_OWNER/$REPO_NAME" \
+                gh repo create "$GH_OWNER/$REPO_NAME" --private --clone=false --description "Drive files version-controlled in git"
+            fi
+            GIT_REPO_URL="https://github.com/$GH_OWNER/$REPO_NAME.git"
             ok "Created: $GIT_REPO_URL"
           fi
         else
