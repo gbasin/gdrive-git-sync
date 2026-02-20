@@ -55,7 +55,7 @@ wait_for_commit() {
   local elapsed=0
 
   echo "  Waiting for commit matching '$pattern' (timeout: ${timeout}s)..."
-  while [ $elapsed -lt $timeout ]; do
+  while [ $elapsed -lt "$timeout" ]; do
     cd "$VERIFY_DIR/repo"
     git pull --quiet 2>/dev/null || true
     if git log --oneline -5 | grep -q "$pattern"; then

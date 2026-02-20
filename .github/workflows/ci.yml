@@ -39,6 +39,21 @@ jobs:
           GIT_BRANCH: main
           GIT_TOKEN_SECRET: test-secret
 
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install bats
+        run: sudo apt-get install -y bats
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+      - name: Bats tests
+        run: bats tests/shell/
+
   terraform:
     runs-on: ubuntu-latest
     steps:

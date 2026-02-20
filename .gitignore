@@ -17,6 +17,7 @@ venv/
 *.tfvars
 *.tfvars.json
 .terraform.lock.hcl
+.terraform.tfstate.lock.info
 
 # Environment
 .env
@@ -38,4 +39,5 @@ htmlcov/
 .coverage
 
 # Deployment
+functions_source.zip
 functions/*.zip

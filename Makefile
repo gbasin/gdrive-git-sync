@@ -1,4 +1,4 @@
-.PHONY: install lint format typecheck test ci deploy setup clean lock
+.PHONY: install lint lint-shell format typecheck test test-shell ci deploy setup clean lock
 
 install:
 	uv sync --all-extras
@@ -6,8 +6,11 @@ install:
 lock:
 	uv lock
 
-lint:
+lint: lint-shell
 	uv run ruff check functions/ tests/
+
+lint-shell:
+	shellcheck scripts/*.sh
 
 format:
 	uv run ruff format functions/ tests/
@@ -17,8 +20,11 @@ format:
 typecheck:
 	uv run mypy functions/
 
-test:
+test: test-shell
 	uv run pytest tests/ -v
+
+test-shell:
+	bats tests/shell/
 
 ci: lint typecheck test
 

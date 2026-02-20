@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2059  # color variables in printf format strings are intentional throughout
 set -euo pipefail
 
 # Interactive setup for gdrive-git-sync
@@ -11,7 +12,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="$ROOT_DIR/.env"
-TFVARS_FILE="$ROOT_DIR/infra/terraform.tfvars"
+
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 # ── Flags ────────────────────────────────────────────────────────────
 AUTO=false
@@ -147,42 +150,13 @@ elif command -v apt-get &>/dev/null; then
   PKG_MGR="apt"
 fi
 
-# Map tools → install commands
-brew_pkg() {
-  case "$1" in
-    gcloud)    echo "--cask google-cloud-sdk" ;;
-    terraform) echo "hashicorp/tap/terraform" ;;
-    git)       echo "git" ;;
-    zip)       echo "zip" ;;
-    gh)        echo "gh" ;;
-  esac
-}
-
-apt_pkg() {
-  case "$1" in
-    gcloud)    echo "" ;;  # no simple apt package
-    terraform) echo "" ;;  # no simple apt package
-    git)       echo "git" ;;
-    zip)       echo "zip" ;;
-    gh)        echo "" ;;  # needs special repo setup
-  esac
-}
-
-install_url() {
-  case "$1" in
-    gcloud)    echo "https://cloud.google.com/sdk/docs/install" ;;
-    terraform) echo "https://developer.hashicorp.com/terraform/install" ;;
-    git)       echo "https://git-scm.com/downloads" ;;
-    zip)       echo "your system package manager" ;;
-    gh)        echo "https://cli.github.com" ;;
-  esac
-}
-
 # ── Required tools ──
 MISSING_TOOLS=()
 for cmd in gcloud terraform git zip; do
   if command -v "$cmd" &>/dev/null; then
     ok "$cmd"
+  elif $DRY_RUN; then
+    warn "$cmd — not found [dry-run: skipping]"
   else
     fail "$cmd — not found"
     MISSING_TOOLS+=("$cmd")
@@ -229,9 +203,10 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
 
       for cmd in "${CAN_INSTALL[@]}"; do
         if [ "$PKG_MGR" = "brew" ]; then
+          # shellcheck disable=SC2046  # word splitting intentional: brew_pkg may return "--cask pkg"
           spin "Installing $cmd" brew install $(brew_pkg "$cmd")
         elif [ "$PKG_MGR" = "apt" ]; then
-          spin "Installing $cmd" sudo apt-get install -y $(apt_pkg "$cmd")
+          spin "Installing $cmd" sudo apt-get install -y "$(apt_pkg "$cmd")"
         fi
       done
 
@@ -436,7 +411,7 @@ ENVEOF
       echo ""
       while true; do
         read -rp "  Project ID: " GCP_PROJECT
-        if [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+        if validate_gcp_project_id "$GCP_PROJECT"; then
           break
         fi
         fail "That doesn't look like a project ID."
@@ -487,7 +462,7 @@ ENVEOF
       read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
       GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
 
-      while ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; do
+      while ! validate_gcp_project_id "$GCP_PROJECT"; do
         fail "That doesn't look right — use lowercase letters, digits, and hyphens."
         read -rp "  Project ID [$SUGGESTED_ID]: " GCP_PROJECT
         GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
@@ -566,7 +541,7 @@ ENVEOF
             SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
             read -rp "  Try a different ID [$SUGGESTED_ID]: " GCP_PROJECT
             GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
-            if ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+            if ! validate_gcp_project_id "$GCP_PROJECT"; then
               fail "Use lowercase letters, digits, and hyphens (6-30 chars)."
               continue
             fi
@@ -680,17 +655,12 @@ ENVEOF
     echo ""
     while true; do
       read -rp "  Drive folder URL: " FOLDER_INPUT
-      if [[ "$FOLDER_INPUT" =~ /folders/([a-zA-Z0-9_-]+) ]]; then
-        DRIVE_FOLDER_ID="${BASH_REMATCH[1]}"
-        ok "Got it: ${DRIVE_FOLDER_ID:0:20}..."
-        break
-      elif [[ "$FOLDER_INPUT" =~ my-drive ]] || [[ "$FOLDER_INPUT" == "root" ]]; then
-        DRIVE_FOLDER_ID="root"
-        ok "Got it — syncing entire My Drive"
-        break
-      elif [[ "$FOLDER_INPUT" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
-        DRIVE_FOLDER_ID="$FOLDER_INPUT"
-        ok "Got it"
+      if DRIVE_FOLDER_ID=$(extract_drive_folder_id "$FOLDER_INPUT"); then
+        if [ "$DRIVE_FOLDER_ID" = "root" ]; then
+          ok "Got it — syncing entire My Drive"
+        else
+          ok "Got it: ${DRIVE_FOLDER_ID:0:20}..."
+        fi
         break
       fi
       fail "I couldn't find a folder ID in that."
@@ -825,7 +795,8 @@ ENVEOF
   echo ""
 
   # Detect host to give specific instructions
-  if [[ "$GIT_REPO_URL" =~ github\.com ]]; then
+  GIT_HOST=$(detect_git_host "$GIT_REPO_URL")
+  if [ "$GIT_HOST" = "github" ]; then
     info "Open this page to create a token:"
     hint "  https://github.com/settings/tokens?type=beta"
     echo ""
@@ -835,12 +806,12 @@ ENVEOF
     hint "  3. Repository access → \"Only select repositories\" → pick your repo"
     hint "  4. Permissions → Repository permissions → Contents → \"Read and write\""
     hint "  5. Click \"Generate token\" and copy it"
-  elif [[ "$GIT_REPO_URL" =~ gitlab\.com ]]; then
+  elif [ "$GIT_HOST" = "gitlab" ]; then
     info "Open your repo → Settings → Access Tokens, then:"
     hint "  1. Create a project access token"
     hint "  2. Scope: write_repository"
     hint "  3. Copy the token"
-  elif [[ "$GIT_REPO_URL" =~ bitbucket\.org ]]; then
+  elif [ "$GIT_HOST" = "bitbucket" ]; then
     info "Open your repo → Repository settings → Access tokens, then:"
     hint "  1. Create a token with \"Repositories: Write\" permission"
     hint "  2. Copy the token"
@@ -860,9 +831,9 @@ ENVEOF
 
   # Quick validation — check if the token can access the repo
   info "Checking if the token works..."
-  if [[ "$GIT_REPO_URL" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
-    OWNER="${BASH_REMATCH[1]}"
-    REPO="${BASH_REMATCH[2]%.git}"
+  if [ "$GIT_HOST" = "github" ] && OWNER_REPO=$(extract_github_owner_repo "$GIT_REPO_URL"); then
+    OWNER="${OWNER_REPO%% *}"
+    REPO="${OWNER_REPO##* }"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
       -H "Authorization: token $GIT_TOKEN_VALUE" \
       -H "Accept: application/vnd.github+json" \
@@ -878,7 +849,7 @@ ENVEOF
       read -rp "  Continue anyway? [Y/n]: " CONTINUE
       if [[ "${CONTINUE:-Y}" =~ ^[Nn] ]]; then ERROR_HANDLED=true; exit 1; fi
     fi
-  elif [[ "$GIT_REPO_URL" =~ gitlab\.com[:/](.+) ]]; then
+  elif [ "$GIT_HOST" = "gitlab" ] && [[ "$GIT_REPO_URL" =~ gitlab\.com[:/](.+) ]]; then
     GL_PATH="${BASH_REMATCH[1]%.git}"
     GL_PATH="${GL_PATH%/}"
     GL_ENCODED=$(echo "$GL_PATH" | sed 's/\//%2F/g')
@@ -900,7 +871,10 @@ ENVEOF
 
   # ── Final .env write ──
   write_env
-  set -a; source "$ENV_FILE"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
   echo ""
   ok "Configuration saved to .env"
   hint "Your settings live in this file. You can edit it anytime and re-run setup."
@@ -1089,11 +1063,12 @@ else
   echo ""
   info "No git token found in Secret Manager."
   # Give host-specific instructions (same as Section D in Phase 2)
-  if [[ "${GIT_REPO_URL:-}" =~ github\.com ]]; then
+  TOKEN_HOST=$(detect_git_host "${GIT_REPO_URL:-}")
+  if [ "$TOKEN_HOST" = "github" ]; then
     hint "Create one at: https://github.com/settings/tokens?type=beta"
     hint "  → Generate new token → Repository access: your repo"
     hint "  → Permissions → Contents → Read and write → Generate"
-  elif [[ "${GIT_REPO_URL:-}" =~ gitlab\.com ]]; then
+  elif [ "$TOKEN_HOST" = "gitlab" ]; then
     hint "Open your repo → Settings → Access Tokens"
     hint "  → Scope: write_repository → Create"
   else
