@@ -68,32 +68,43 @@ spin() {
     return 0
   fi
 
-  local logfile; logfile=$(mktemp)
-  local rc=0 s=0
+  local logfile rc s pid reply
 
-  "$@" >"$logfile" 2>&1 &
-  local pid=$!
+  while true; do
+    logfile=$(mktemp)
+    rc=0; s=0
 
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\r  ⏳ %s (%ds) " "$msg" "$s"
-    sleep 1
-    s=$((s + 1))
-  done
+    "$@" >"$logfile" 2>&1 &
+    pid=$!
 
-  wait "$pid" || rc=$?
+    while kill -0 "$pid" 2>/dev/null; do
+      printf "\r  ⏳ %s (%ds) " "$msg" "$s"
+      sleep 1
+      s=$((s + 1))
+    done
 
-  if [ $rc -eq 0 ]; then
-    printf "\r  ${GREEN}✔${NC} %s (%ds)          \n" "$msg" "$s"
-  else
+    wait "$pid" || rc=$?
+
+    if [ $rc -eq 0 ]; then
+      printf "\r  ${GREEN}✔${NC} %s (%ds)          \n" "$msg" "$s"
+      rm -f "$logfile"
+      return 0
+    fi
+
     printf "\r  ${RED}✘${NC} %s — failed after %ds\n" "$msg" "$s"
     echo ""
     tail -20 "$logfile" | sed 's/^/      /'
     echo ""
-    hint "Fix the issue above and re-run: make setup"
     rm -f "$logfile"
-    ERROR_HANDLED=true; exit 1
-  fi
-  rm -f "$logfile"
+    if $AUTO; then
+      hint "Fix the issue above and re-run: make setup"
+      ERROR_HANDLED=true; exit 1
+    fi
+    read -rp "  Retry? [Y/n]: " reply
+    if [[ "${reply:-Y}" =~ ^[Nn] ]]; then
+      ERROR_HANDLED=true; exit 1
+    fi
+  done
 }
 
 # ── Error handler ────────────────────────────────────────────────────
@@ -253,8 +264,26 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
     for cmd in "${MANUAL_INSTALL[@]}"; do
       hint "$cmd → $(install_url "$cmd")"
     done
-    fail "Install them manually, then re-run."
-    ERROR_HANDLED=true; exit 1
+    if $AUTO; then
+      fail "Install them manually, then re-run."
+      ERROR_HANDLED=true; exit 1
+    fi
+    echo ""
+    read -rp "  Press Enter after installing them (or Ctrl-C to quit)..."
+    # Re-check
+    ALL_FOUND=true
+    for cmd in "${MANUAL_INSTALL[@]}"; do
+      if command -v "$cmd" &>/dev/null; then
+        ok "$cmd found"
+      else
+        fail "$cmd still not found — make sure it's in your PATH"
+        ALL_FOUND=false
+      fi
+    done
+    if ! $ALL_FOUND; then
+      hint "You may need to restart your terminal for PATH changes to take effect."
+      ERROR_HANDLED=true; exit 1
+    fi
   fi
 fi
 
@@ -343,9 +372,9 @@ else
     if [[ ! "${USE_PREV:-Y}" =~ ^[Nn] ]]; then
       GCP_PROJECT="$PREV_PROJECT"
       ok "Using project $GCP_PROJECT"
-      # Check auth state
+      # Check auth state — verify token is actually valid, not just configured
       CURRENT_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
-      if [ -n "$CURRENT_ACCOUNT" ]; then
+      if [ -n "$CURRENT_ACCOUNT" ] && gcloud auth print-access-token &>/dev/null; then
         ok "Authenticated as $CURRENT_ACCOUNT"
         FULL_AUTH_DONE=true
       fi
@@ -418,7 +447,15 @@ ENVEOF
       echo ""
       CURRENT_ACCOUNT=$(sim "dryrun@example.com" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || true)
       if [ -n "$CURRENT_ACCOUNT" ]; then
-        ok "Already signed in as $CURRENT_ACCOUNT"
+        # Verify token is still valid, not just that an account is configured
+        if $DRY_RUN || gcloud auth print-access-token &>/dev/null; then
+          ok "Already signed in as $CURRENT_ACCOUNT"
+        else
+          hint "Session for $CURRENT_ACCOUNT has expired — let's refresh it."
+          read -rp "  Press Enter to open the browser..."
+          gcloud auth login
+          ok "Signed in"
+        fi
       else
         read -rp "  Press Enter to open the browser..."
         if ! $DRY_RUN; then gcloud auth login; fi
@@ -480,20 +517,80 @@ ENVEOF
 
         if [ $CREATE_RC -eq 0 ]; then
           printf "\r  ${GREEN}✔${NC} Created project: %s (%ds)          \n" "$GCP_PROJECT" "$CREATE_S"
+          rm -f "$CREATE_LOG"
         elif grep -q "Terms of Service" "$CREATE_LOG"; then
           printf "\r  ${RED}✘${NC} Couldn't create the project — Google needs you to accept their Terms of Service first.\n"
           echo ""
-          hint "This is a one-time thing. Here's what to do:"
-          hint "  1. Open: https://console.cloud.google.com"
-          hint "  2. You'll see a Terms of Service prompt — accept it"
-          hint "  3. Come back here and re-run: make setup"
-          rm -f "$CREATE_LOG"
-          ERROR_HANDLED=true; exit 1
+          hint "This is a one-time thing. I'll open the page for you —"
+          hint "accept the Terms of Service, then come back and press Enter."
+          echo ""
+          open "https://console.cloud.google.com" 2>/dev/null \
+            || xdg-open "https://console.cloud.google.com" 2>/dev/null \
+            || hint "Open: https://console.cloud.google.com"
+          read -rp "  Press Enter after accepting the Terms of Service..."
+          echo ""
+          info "Retrying project creation..."
+          CREATE_LOG2=$(mktemp)
+          CREATE_S=0
+          gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync" >"$CREATE_LOG2" 2>&1 &
+          CREATE_PID=$!
+          while kill -0 "$CREATE_PID" 2>/dev/null; do
+            printf "\r  ⏳ Creating project %s (%ds) " "$GCP_PROJECT" "$CREATE_S"
+            sleep 1
+            CREATE_S=$((CREATE_S + 1))
+          done
+          CREATE_RC=0
+          wait "$CREATE_PID" || CREATE_RC=$?
+          if [ $CREATE_RC -eq 0 ]; then
+            printf "\r  ${GREEN}✔${NC} Created project: %s (%ds)          \n" "$GCP_PROJECT" "$CREATE_S"
+          else
+            printf "\r  ${RED}✘${NC} Still couldn't create the project.\n"
+            hint "Make sure you accepted the Terms of Service at:"
+            hint "  https://console.cloud.google.com"
+            hint "Then re-run: make setup"
+            rm -f "$CREATE_LOG" "$CREATE_LOG2"
+            ERROR_HANDLED=true; exit 1
+          fi
+          rm -f "$CREATE_LOG2"
         elif grep -q "already in use" "$CREATE_LOG"; then
           printf "\r  ${RED}✘${NC} That project ID is already taken by someone else.\n"
-          hint "Try a different name — re-run: make setup"
           rm -f "$CREATE_LOG"
-          ERROR_HANDLED=true; exit 1
+          while true; do
+            SUGGESTED_ID="gdrive-sync-$(( RANDOM % 90000 + 10000 ))"
+            read -rp "  Try a different ID [$SUGGESTED_ID]: " GCP_PROJECT
+            GCP_PROJECT="${GCP_PROJECT:-$SUGGESTED_ID}"
+            if ! [[ "$GCP_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+              fail "Use lowercase letters, digits, and hyphens (6-30 chars)."
+              continue
+            fi
+            CREATE_LOG=$(mktemp)
+            CREATE_S=0
+            gcloud projects create "$GCP_PROJECT" --name="gdrive-git-sync" >"$CREATE_LOG" 2>&1 &
+            CREATE_PID=$!
+            while kill -0 "$CREATE_PID" 2>/dev/null; do
+              printf "\r  ⏳ Creating project %s (%ds) " "$GCP_PROJECT" "$CREATE_S"
+              sleep 1
+              CREATE_S=$((CREATE_S + 1))
+            done
+            CREATE_RC=0
+            wait "$CREATE_PID" || CREATE_RC=$?
+            if [ $CREATE_RC -eq 0 ]; then
+              printf "\r  ${GREEN}✔${NC} Created project: %s (%ds)          \n" "$GCP_PROJECT" "$CREATE_S"
+              rm -f "$CREATE_LOG"
+              break
+            elif grep -q "already in use" "$CREATE_LOG"; then
+              printf "\r  ${RED}✘${NC} That one's taken too.\n"
+              rm -f "$CREATE_LOG"
+            else
+              printf "\r  ${RED}✘${NC} Creating project failed:\n"
+              echo ""
+              sed 's/^/      /' "$CREATE_LOG"
+              echo ""
+              hint "Fix the issue above and re-run: make setup"
+              rm -f "$CREATE_LOG"
+              ERROR_HANDLED=true; exit 1
+            fi
+          done
         else
           printf "\r  ${RED}✘${NC} Creating project failed:\n"
           echo ""
@@ -503,7 +600,6 @@ ENVEOF
           rm -f "$CREATE_LOG"
           ERROR_HANDLED=true; exit 1
         fi
-        rm -f "$CREATE_LOG"
       fi
       if ! $DRY_RUN; then gcloud config set project "$GCP_PROJECT" 2>/dev/null; fi
 
@@ -806,7 +902,7 @@ elif $FULL_AUTH_DONE; then
   ok "Authenticated as $CURRENT_ACCOUNT"
 else
   # Interactive: guide through login if needed
-  if [ -n "$CURRENT_ACCOUNT" ]; then
+  if [ -n "$CURRENT_ACCOUNT" ] && gcloud auth print-access-token &>/dev/null; then
     ok "Authenticated as $CURRENT_ACCOUNT"
   else
     echo ""
