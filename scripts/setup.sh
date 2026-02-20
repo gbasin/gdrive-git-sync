@@ -1354,13 +1354,21 @@ else
     echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
     echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
   else
+    printf "  ⏳ Initializing watch channel and syncing existing files..."
     WATCH_RESULT=$(curl -s -X POST "${SETUP_URL}?initial_sync=true" \
       -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
+    printf "\r\033[2K"
 
     WATCH_STATUS=$(json_field "$WATCH_RESULT" "status")
 
     if [ "$WATCH_STATUS" = "ok" ] || [ "$WATCH_STATUS" = "initialized" ]; then
+      SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
       ok "Watch channel initialized — Drive sync is active!"
+      if [ -n "$SYNC_COUNT" ] && [ "$SYNC_COUNT" != "0" ]; then
+        ok "Initial sync complete: $SYNC_COUNT files committed to git"
+      elif [ "$SYNC_COUNT" = "0" ]; then
+        hint "No new files to sync (folder empty or already up-to-date)"
+      fi
     else
       ERR=$(json_error "$WATCH_RESULT")
       if [ -n "$ERR" ]; then

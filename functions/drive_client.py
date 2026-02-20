@@ -60,6 +60,8 @@ class DriveClient:
                     spaces="drive",
                     includeRemoved=True,
                     pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
                 )
                 .execute()
             )
@@ -74,7 +76,7 @@ class DriveClient:
 
     def get_start_page_token(self) -> str:
         """Get the current start page token for changes.list."""
-        response = self.service.changes().getStartPageToken().execute()
+        response = self.service.changes().getStartPageToken(supportsAllDrives=True).execute()
         return str(response["startPageToken"])
 
     def list_all_files(self) -> list[dict]:
@@ -102,6 +104,8 @@ class DriveClient:
                         fields=f"nextPageToken,files({LIST_FILE_FIELDS})",
                         pageSize=1000,
                         pageToken=page_token,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
                     )
                     .execute()
                 )
@@ -139,7 +143,7 @@ class DriveClient:
 
             # Look up parent's parents
             try:
-                parent = self.service.files().get(fileId=parent_id, fields="parents").execute()
+                parent = self.service.files().get(fileId=parent_id, fields="parents", supportsAllDrives=True).execute()
                 parent_parents = parent.get("parents", [])
                 to_check.extend(parent_parents)
             except Exception:
@@ -168,7 +172,7 @@ class DriveClient:
             parts.append(folder_name)
             # Get parent of parent
             try:
-                parent_file = self.service.files().get(fileId=current_parent, fields="name,parents").execute()
+                parent_file = self.service.files().get(fileId=current_parent, fields="name,parents", supportsAllDrives=True).execute()
                 parent_parents = parent_file.get("parents", [])
                 current_parent = parent_parents[0] if parent_parents else None
             except Exception:
@@ -182,7 +186,7 @@ class DriveClient:
         if folder_id in self._folder_cache:
             return self._folder_cache[folder_id]
         try:
-            result = self.service.files().get(fileId=folder_id, fields="name").execute()
+            result = self.service.files().get(fileId=folder_id, fields="name", supportsAllDrives=True).execute()
             name: str | None = result.get("name")
             self._folder_cache[folder_id] = name
             return name
@@ -221,7 +225,7 @@ class DriveClient:
 
     def download_file(self, file_id: str) -> bytes:
         """Download a binary file from Drive."""
-        request = self.service.files().get_media(fileId=file_id)
+        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
         buffer = io.BytesIO()
         downloader = MediaIoBaseDownload(buffer, request)
         done = False
@@ -256,6 +260,7 @@ class DriveClient:
                 pageToken=page_token,
                 body=body,
                 fields="resourceId,expiration",
+                supportsAllDrives=True,
             )
             .execute()
         )
