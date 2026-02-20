@@ -979,7 +979,8 @@ if $APIS_NEEDED; then
       drive.googleapis.com \
       cloudbuild.googleapis.com \
       run.googleapis.com \
-      artifactregistry.googleapis.com
+      artifactregistry.googleapis.com \
+      siteverification.googleapis.com
   ok "All services enabled"
 fi
 
@@ -1091,118 +1092,336 @@ echo ""
 ok "Infrastructure is ready!"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Phase 4 — What's left
+# Phase 4 — Connect everything
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase "4/4" "Three quick things to finish in the browser"
+phase "4/4" "Connecting everything"
 
-info "The automated part is done! Three things need to be done in the browser"
-info "because Google requires manual approval for each. They're quick."
+SYNC_URL=$(sim "https://drive-sync-handler-abc123-uc.a.run.app" terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url 2>/dev/null || echo "")
+SETUP_URL=$(sim "https://drive-sync-setup-abc123-uc.a.run.app/setup-watch" terraform -chdir="$ROOT_DIR/infra" output -raw setup_watch_url 2>/dev/null || echo "")
+SA_EMAIL=$(sim "drive-sync@my-project-12345.iam.gserviceaccount.com" terraform -chdir="$ROOT_DIR/infra" output -raw service_account_email 2>/dev/null || echo "")
+REGION="${REGION:-us-central1}"
 
-SYNC_URL=$(sim "https://drive-sync-handler-abc123-uc.a.run.app" terraform -chdir="$ROOT_DIR/infra" output -raw sync_handler_url 2>/dev/null || echo "<run make deploy first>")
-SETUP_URL=$(sim "https://drive-sync-setup-abc123-uc.a.run.app/setup-watch" terraform -chdir="$ROOT_DIR/infra" output -raw setup_watch_url 2>/dev/null || echo "<run make deploy first>")
-SA_EMAIL=$(sim "drive-sync@my-project-12345.iam.gserviceaccount.com" terraform -chdir="$ROOT_DIR/infra" output -raw service_account_email 2>/dev/null || echo "<run make deploy first>")
-# Extract just the domain from the sync URL for step 1
-SYNC_DOMAIN=$(echo "$SYNC_URL" | sed -n 's|https://\([^/]*\).*|\1|p')
+if [ -z "$SYNC_URL" ] || [ -z "$SA_EMAIL" ]; then
+  fail "Couldn't read deployment outputs. Run 'make deploy' first."
+  ERROR_HANDLED=true; exit 1
+fi
 
-echo ""
-printf "  ${BOLD}1. Verify your webhook URL${NC} ${DIM}(~5 min, one-time)${NC}\n"
-echo ""
-hint "Google Drive will send a notification to your sync function every time"
-hint "a file changes. But first, Google needs to verify that you actually own"
-hint "the URL. This is a security measure — you only do it once."
-echo ""
-echo -e "    ${BOLD}Part A — Prove ownership in Search Console:${NC}"
-hint "  1. Open: https://search.google.com/search-console"
-hint "  2. Click \"Add property\" (top-left dropdown → \"Add property\")"
-hint "  3. Choose \"URL prefix\" (right side of the popup)"
-hint "  4. Paste this URL:"
-echo -e "       ${BOLD}$SYNC_URL${NC}"
-hint "  5. Choose \"HTML file\" verification — your function already serves"
-hint "     the file, so just click \"Verify.\" It should turn green."
-echo ""
-echo -e "    ${BOLD}Part B — Register the domain in GCP:${NC}"
-hint "  1. Open: https://console.cloud.google.com/apis/credentials/domainverification"
-hint "  2. Click \"Add domain\""
-hint "  3. Enter:"
-echo -e "       ${BOLD}$SYNC_DOMAIN${NC}"
-hint "  4. Click \"Add domain\""
-echo ""
-hint "After both parts, Drive notifications will flow to your sync function."
+# ── Extra OAuth scopes ──────────────────────────────────────────────
+# gcloud's default scopes don't include Drive or Site Verification,
+# so we need one more sign-in to automate the remaining steps.
+EXTRA_SCOPES_TOKEN=""
 
-echo ""
-printf "  ${BOLD}2. Share your Drive folder with the bot${NC} ${DIM}(~1 min)${NC}\n"
-echo ""
-hint "Your sync bot has its own email address. Share the Drive folder with it"
-hint "just like you'd share with a colleague:"
-hint "  1. Open your Drive folder in the browser"
-hint "  2. Click the Share button"
-hint "  3. Paste this email:"
-echo -e "       ${BOLD}$SA_EMAIL${NC}"
-hint "  4. Set permission to \"Editor\""
-hint "  5. Uncheck \"Notify people\" and click Share"
+if $DRY_RUN; then
+  EXTRA_SCOPES_TOKEN="dry-run-token"
+  ok "Would request extra OAuth scopes [dry-run]"
+elif $AUTO; then
+  # In auto mode we can't open a browser. Use existing ADC if available
+  # (may lack siteverification/drive scopes — API calls will fail gracefully).
+  EXTRA_SCOPES_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
+  if [ -z "$EXTRA_SCOPES_TOKEN" ]; then
+    warn "No application-default credentials found — manual steps will be printed."
+    EXTRA_SCOPES_TOKEN=""
+  fi
+else
+  echo ""
+  info "One more sign-in to let me automate the remaining steps."
+  hint "Same account, same browser — just click Accept. This grants"
+  hint "permission to share Drive folders and verify domains on your behalf."
+  echo ""
+  if gcloud auth application-default login \
+    --scopes="openid,email,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/siteverification,https://www.googleapis.com/auth/drive" \
+    2>/dev/null; then
+    gcloud auth application-default set-quota-project "$GCP_PROJECT" 2>/dev/null || true
+    EXTRA_SCOPES_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
+    ok "Permissions granted"
+  else
+    warn "Sign-in was cancelled — I'll print manual instructions instead."
+  fi
+fi
 
-echo ""
-printf "  ${BOLD}3. Flip the switch${NC} ${DIM}(~1 min)${NC}\n"
-echo ""
-hint "This command tells Google Drive to start sending change notifications"
-hint "to your sync function. It also does an initial sync of existing files."
-hint "Run this in your terminal:"
-echo ""
-echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
-echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
-echo ""
-hint "You should see a JSON response with \"status\": \"ok\"."
-hint "After that, any file added or edited in the Drive folder will"
-hint "automatically appear as a commit in your git repo."
+# Helper: call a Google API and return the JSON response.
+# Sets API_OK=true if the response looks like a success (has expected fields, no error).
+api_call() {
+  local method="$1" url="$2" body="${3:-}"
+  API_RESULT=""
+  API_OK=false
+  if [ -z "$EXTRA_SCOPES_TOKEN" ]; then return 1; fi
+  if [ "$EXTRA_SCOPES_TOKEN" = "dry-run-token" ]; then API_OK=true; return 0; fi
 
+  # X-Goog-User-Project is required — ADC tokens use gcloud's default OAuth
+  # client, and most Google APIs refuse requests unless billing is routed
+  # to the user's project.
+  if [ -n "$body" ]; then
+    API_RESULT=$(curl -s -X "$method" "$url" \
+      -H "Authorization: Bearer $EXTRA_SCOPES_TOKEN" \
+      -H "Content-Type: application/json" \
+      -H "X-Goog-User-Project: $GCP_PROJECT" \
+      -d "$body" 2>/dev/null || echo "")
+  else
+    API_RESULT=$(curl -s -X "$method" "$url" \
+      -H "Authorization: Bearer $EXTRA_SCOPES_TOKEN" \
+      -H "X-Goog-User-Project: $GCP_PROJECT" 2>/dev/null || echo "")
+  fi
+
+  # Check for success: response has a known success field and no error
+  if echo "$API_RESULT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert 'error' not in d
+assert any(k in d for k in ('id','token','owners','items','kind'))
+" 2>/dev/null; then
+    API_OK=true
+  fi
+}
+
+# Helper: extract a JSON field.
+json_field() {
+  echo "$1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$2',''))" 2>/dev/null || echo ""
+}
+
+json_error() {
+  echo "$1" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+e=d.get('error',{})
+print(e.get('message','') if isinstance(e,dict) else str(e))
+" 2>/dev/null || echo ""
+}
+
+# ── Step 1: Domain verification ─────────────────────────────────────
 echo ""
-echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
-echo -e "  ${DIM}Complete the three steps above and your files will sync automatically.${NC}"
+printf "  ${BOLD}Step 1: Verify webhook URL${NC}\n"
+hint "Google needs to confirm you own the webhook URL before it will"
+hint "send Drive change notifications to it."
+
+VERIFY_DONE=false
+
+if [ -n "$EXTRA_SCOPES_TOKEN" ] && [ "$EXTRA_SCOPES_TOKEN" != "dry-run-token" ]; then
+  # Check if already verified
+  api_call GET "https://www.googleapis.com/siteVerification/v1/webResource"
+  ALREADY_VERIFIED=false
+  if [ -n "$API_RESULT" ]; then
+    if echo "$API_RESULT" | SYNC_URL="$SYNC_URL" python3 -c "
+import sys,json,os
+items=json.load(sys.stdin).get('items',[])
+target=os.environ['SYNC_URL']
+domain=target.split('/')[2]  # extract domain from URL
+for i in items:
+  site=i.get('site',{}).get('identifier','')
+  if target.startswith(site) or domain in site:
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+      ALREADY_VERIFIED=true
+    fi
+  fi
+
+  if $ALREADY_VERIFIED; then
+    ok "Domain already verified"
+    VERIFY_DONE=true
+  else
+    # Get verification token
+    api_call POST "https://www.googleapis.com/siteVerification/v1/token" \
+      "{\"site\":{\"type\":\"SITE\",\"identifier\":\"$SYNC_URL\"},\"verificationMethod\":\"FILE\"}"
+
+    SITE_TOKEN=$(json_field "$API_RESULT" "token")
+
+    if [ -n "$SITE_TOKEN" ]; then
+      # Update function to serve the verification file
+      spin "Setting verification token on function" \
+        gcloud run services update drive-sync-handler \
+          --region="$REGION" \
+          --project="$GCP_PROJECT" \
+          --update-env-vars "GOOGLE_VERIFICATION_TOKEN=$SITE_TOKEN" \
+          --quiet
+
+      # Save to .env for future deploys
+      if grep -q "^GOOGLE_VERIFICATION_TOKEN=" "$ENV_FILE" 2>/dev/null; then
+        # Portable sed -i (macOS requires '' arg, GNU doesn't)
+        if sed --version 2>/dev/null | grep -q GNU; then
+          sed -i "s|^GOOGLE_VERIFICATION_TOKEN=.*|GOOGLE_VERIFICATION_TOKEN=\"$SITE_TOKEN\"|" "$ENV_FILE"
+        else
+          sed -i '' "s|^GOOGLE_VERIFICATION_TOKEN=.*|GOOGLE_VERIFICATION_TOKEN=\"$SITE_TOKEN\"|" "$ENV_FILE"
+        fi
+      else
+        echo "GOOGLE_VERIFICATION_TOKEN=\"$SITE_TOKEN\"" >> "$ENV_FILE"
+      fi
+
+      # Wait for update to propagate, then verify (retry a few times)
+      for attempt in 1 2 3; do
+        sleep $((attempt * 5))
+        api_call POST \
+          "https://www.googleapis.com/siteVerification/v1/webResource?verificationMethod=FILE" \
+          "{\"site\":{\"type\":\"SITE\",\"identifier\":\"$SYNC_URL\"}}"
+
+        if $API_OK; then
+          ok "Domain verified"
+          VERIFY_DONE=true
+          break
+        fi
+        [ "$attempt" -lt 3 ] && info "Waiting for function to update... (attempt $attempt/3)"
+      done
+
+      if ! $VERIFY_DONE; then
+        ERR=$(json_error "$API_RESULT")
+        warn "Automatic verification failed${ERR:+: $ERR}"
+      fi
+    else
+      ERR=$(json_error "$API_RESULT")
+      warn "Couldn't get verification token${ERR:+: $ERR}"
+      hint "The siteverification scope may not have been granted."
+    fi
+  fi
+elif $DRY_RUN; then
+  ok "Would verify domain [dry-run]"
+  VERIFY_DONE=true
+fi
+
+if ! $VERIFY_DONE && ! $DRY_RUN; then
+  echo ""
+  warn "Automatic verification didn't work. Complete manually:"
+  hint "  1. Open: https://search.google.com/search-console"
+  hint "  2. Add property → URL prefix → paste:"
+  echo -e "       ${BOLD}$SYNC_URL${NC}"
+  hint "  3. Choose \"HTML file\" verification → click Verify"
+  echo ""
+  if ! $AUTO; then
+    read -rp "  Press Enter after completing verification..." _
+  fi
+fi
+
+# ── Step 2: Share Drive folder ──────────────────────────────────────
 echo ""
-hint "Your configuration is saved in .env — edit it anytime and re-run: make setup"
-hint ""
-hint "Need help with the steps above? Paste this into Claude, ChatGPT, or any AI:"
+printf "  ${BOLD}Step 2: Share Drive folder with the bot${NC}\n"
+
+SHARE_DONE=false
+
+if [ -n "$EXTRA_SCOPES_TOKEN" ] && [ "$EXTRA_SCOPES_TOKEN" != "dry-run-token" ]; then
+  # Grant the service account Editor access to the Drive folder.
+  # If already shared, the API returns an error caught below.
+  api_call POST \
+    "https://www.googleapis.com/drive/v3/files/${DRIVE_FOLDER_ID}/permissions?sendNotificationEmail=false" \
+    "{\"type\":\"user\",\"role\":\"writer\",\"emailAddress\":\"$SA_EMAIL\"}"
+
+  if $API_OK; then
+    ok "Drive folder shared with bot ($SA_EMAIL)"
+    SHARE_DONE=true
+  else
+    ERR=$(json_error "$API_RESULT")
+    # "already has access" is fine
+    if echo "$ERR" | grep -qi "already"; then
+      ok "Bot already has access to the Drive folder"
+      SHARE_DONE=true
+    else
+      warn "Couldn't share automatically${ERR:+: $ERR}"
+    fi
+  fi
+elif $DRY_RUN; then
+  ok "Would share Drive folder [dry-run]"
+  SHARE_DONE=true
+fi
+
+if ! $SHARE_DONE && ! $DRY_RUN; then
+  hint "Share manually:"
+  hint "  1. Open your Drive folder in the browser"
+  hint "  2. Share → paste:"
+  echo -e "       ${BOLD}$SA_EMAIL${NC}"
+  hint "  3. Set to Editor → uncheck Notify → Share"
+  echo ""
+  if ! $AUTO; then
+    read -rp "  Press Enter after sharing..." _
+  fi
+fi
+
+# ── Step 3: Start watching ──────────────────────────────────────────
 echo ""
-echo "  I just set up gdrive-git-sync (https://github.com/garybasin/gdrive-git-sync)."
-echo "  I need to complete the manual browser steps. Here are my details:"
-echo "  - Sync URL: $SYNC_URL"
-echo "  - Service account: $SA_EMAIL"
-echo "  - Setup URL: $SETUP_URL"
-echo "  Walk me through each step."
+printf "  ${BOLD}Step 3: Starting Drive sync${NC}\n"
+hint "Telling Google Drive to send change notifications to your function"
+hint "and running an initial sync of existing files."
+
+if $DRY_RUN; then
+  ok "Would initialize watch channel [dry-run]"
+else
+  IDENTITY_TOKEN=$(gcloud auth print-identity-token --audiences="$SETUP_URL" 2>/dev/null || true)
+  # Fallback without --audiences if token doesn't look like a JWT
+  if [ -z "$IDENTITY_TOKEN" ] || [[ ! "$IDENTITY_TOKEN" =~ ^ey ]]; then
+    IDENTITY_TOKEN=$(gcloud auth print-identity-token 2>/dev/null || true)
+  fi
+  if [ -z "$IDENTITY_TOKEN" ] || [[ ! "$IDENTITY_TOKEN" =~ ^ey ]]; then
+    warn "Couldn't get identity token."
+    hint "Run manually:"
+    echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
+    echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+  else
+    WATCH_RESULT=$(curl -s -X POST "${SETUP_URL}?initial_sync=true" \
+      -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
+
+    WATCH_STATUS=$(json_field "$WATCH_RESULT" "status")
+
+    if [ "$WATCH_STATUS" = "ok" ] || [ "$WATCH_STATUS" = "initialized" ]; then
+      ok "Watch channel initialized — Drive sync is active!"
+    else
+      ERR=$(json_error "$WATCH_RESULT")
+      if [ -n "$ERR" ]; then
+        warn "Watch setup returned: $ERR"
+      else
+        warn "Watch setup may have failed."
+      fi
+      hint "This often means domain verification isn't complete."
+      hint "Complete step 1, then run:"
+      echo ""
+      echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
+      echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+    fi
+  fi
+fi
+
+# ── Done ────────────────────────────────────────────────────────────
 echo ""
+if $VERIFY_DONE && $SHARE_DONE; then
+  echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
+  echo -e "  ${DIM}Any file added or edited in your Drive folder will automatically${NC}"
+  echo -e "  ${DIM}appear as a commit in your git repo.${NC}"
+else
+  echo -e "  ${YELLOW}${BOLD}Almost done!${NC}"
+  echo -e "  ${DIM}Complete the manual steps above, then re-run: make setup${NC}"
+fi
+echo ""
+hint "Your configuration is saved in .env — edit anytime and re-run: make setup"
 
 # ── Machine-readable summary for agent mode ──
 if $AUTO; then
+  STEPS_REMAINING=0
+  $VERIFY_DONE || STEPS_REMAINING=$((STEPS_REMAINING + 1))
+  $SHARE_DONE  || STEPS_REMAINING=$((STEPS_REMAINING + 1))
+
+  echo ""
   echo "--- AGENT SUMMARY ---"
   echo "STATUS: success"
-  echo "MANUAL_STEPS_REQUIRED: 3"
-  echo ""
-  echo "STEP_1: Domain verification"
-  echo "  ACTION: Register webhook URL with Google Search Console and API Console Domain Verification"
-  echo "  SYNC_HANDLER_URL: $SYNC_URL"
-  echo "  SYNC_DOMAIN: $SYNC_DOMAIN"
-  echo "  SEARCH_CONSOLE: https://search.google.com/search-console"
-  echo "  DOMAIN_VERIFICATION: https://console.cloud.google.com/apis/credentials/domainverification"
-  echo "  VERIFICATION_METHOD: HTML file (auto-served by the function)"
-  echo ""
-  echo "STEP_2: Share Drive folder"
-  echo "  ACTION: Share the monitored Drive folder with the service account"
-  echo "  SERVICE_ACCOUNT: $SA_EMAIL"
-  echo "  ACCESS_LEVEL: Editor"
-  echo ""
-  echo "STEP_3: Initialize watch channel"
-  echo "  ACTION: Send POST request to start watching for Drive changes"
-  echo "  COMMAND: curl -X POST \"${SETUP_URL}?initial_sync=true\" -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
-  echo ""
-  TOKEN_STORED=false
-  [ -n "$HAS_VERSION" ] && TOKEN_STORED=true
-  # Also true if we just stored it during this run (HAS_VERSION was set before store_token)
-  gcloud secrets versions list "$SECRET_NAME" --limit=1 --format="value(name)" 2>/dev/null | grep -q . && TOKEN_STORED=true
-  if ! $TOKEN_STORED; then
-    echo "WARNING: Git token not stored in Secret Manager."
-    echo "  ACTION: Store token before initializing watch"
-    echo "  COMMAND: echo -n 'YOUR_TOKEN' | gcloud secrets versions add $SECRET_NAME --data-file=-"
+  echo "MANUAL_STEPS_REMAINING: $STEPS_REMAINING"
+  echo "SYNC_HANDLER_URL: $SYNC_URL"
+  echo "SERVICE_ACCOUNT: $SA_EMAIL"
+  echo "SETUP_WATCH_URL: $SETUP_URL"
+
+  if ! $VERIFY_DONE; then
     echo ""
+    echo "PENDING: Domain verification"
+    echo "  SEARCH_CONSOLE: https://search.google.com/search-console"
+    echo "  SYNC_URL: $SYNC_URL"
   fi
+  if ! $SHARE_DONE; then
+    echo ""
+    echo "PENDING: Share Drive folder with $SA_EMAIL (Editor)"
+  fi
+
+  TOKEN_STORED=false
+  [ -n "${HAS_VERSION:-}" ] && TOKEN_STORED=true
+  gcloud secrets versions list "${SECRET_NAME:-git-token}" --limit=1 --format="value(name)" 2>/dev/null | grep -q . && TOKEN_STORED=true
+  if ! $TOKEN_STORED; then
+    echo ""
+    echo "PENDING: Git token not stored in Secret Manager"
+    echo "  COMMAND: echo -n 'YOUR_TOKEN' | gcloud secrets versions add ${SECRET_NAME:-git-token} --data-file=-"
+  fi
+  echo ""
   echo "--- END AGENT SUMMARY ---"
 fi
