@@ -522,6 +522,7 @@ ENVEOF
           printf "\r  ${RED}✘${NC} Couldn't create the project — Google needs you to accept their Terms of Service first.\n"
           echo ""
           hint "This is a one-time thing. I'll open the page for you —"
+          hint "make sure you're signed in as $CURRENT_ACCOUNT in the browser,"
           hint "accept the Terms of Service, then come back and press Enter."
           echo ""
           open "https://console.cloud.google.com" 2>/dev/null \
@@ -667,6 +668,7 @@ ENVEOF
     hint "Which folder in your Google Drive should we watch for changes?"
     hint "Open it in your browser and copy the URL from the address bar."
     hint "It'll look like: drive.google.com/drive/folders/1aBcD..."
+    hint "To sync your entire Drive, paste the My Drive URL or type \"root\"."
     echo ""
     hint "You can paste the full URL — I'll extract the folder ID from it."
     echo ""
@@ -676,6 +678,10 @@ ENVEOF
         DRIVE_FOLDER_ID="${BASH_REMATCH[1]}"
         ok "Got it: ${DRIVE_FOLDER_ID:0:20}..."
         break
+      elif [[ "$FOLDER_INPUT" =~ my-drive ]] || [[ "$FOLDER_INPUT" == "root" ]]; then
+        DRIVE_FOLDER_ID="root"
+        ok "Got it — syncing entire My Drive"
+        break
       elif [[ "$FOLDER_INPUT" =~ ^[a-zA-Z0-9_-]{10,}$ ]]; then
         DRIVE_FOLDER_ID="$FOLDER_INPUT"
         ok "Got it"
@@ -683,7 +689,7 @@ ENVEOF
       fi
       fail "I couldn't find a folder ID in that."
       hint "Open drive.google.com, navigate to the folder, and paste the URL"
-      hint "from your browser's address bar."
+      hint "from your browser's address bar. (Or type \"root\" for your entire Drive.)"
     done
     write_env
   else
