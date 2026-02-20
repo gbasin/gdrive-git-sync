@@ -131,6 +131,12 @@ class StateManager:
         docs = self.db.collection(self.collection).document("files").collection("tracked").stream()
         return {doc.id: doc.to_dict() for doc in docs}
 
+    def clear_all_files(self):
+        """Delete all tracked file records."""
+        docs = self.db.collection(self.collection).document("files").collection("tracked").stream()
+        for doc in docs:
+            doc.reference.delete()
+
     def get_files_in_folder(self, folder_path: str) -> dict[str, dict]:
         """Return all tracked files whose path starts with folder_path."""
         all_files = self.get_all_files()

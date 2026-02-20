@@ -211,8 +211,10 @@ def setup_watch(request: Request):
             if state.acquire_lock():
                 repo = GitRepo()
                 try:
-                    count = run_initial_sync(drive, state, repo)
-                    result["initial_sync_count"] = count
+                    force = request.args.get("force", "false").lower() == "true"
+                    sync_result = run_initial_sync(drive, state, repo, force=force)
+                    result["initial_sync_count"] = sync_result["count"]
+                    result["initial_sync_debug"] = sync_result["debug"]
                 finally:
                     repo.cleanup()
                     state.release_lock()

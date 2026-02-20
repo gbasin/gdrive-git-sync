@@ -43,7 +43,9 @@ class AuthorCommit:
     files: list["Change"] = field(default_factory=list)
 
 
-def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
+def run_initial_sync(
+    drive: DriveClient, state: StateManager, repo: GitRepo, *, force: bool = False,
+) -> dict[str, object]:
     """Full folder listing + download for existing Drive files.
 
     Unlike ``run_sync`` (which uses the delta/changes feed), this walks
@@ -56,17 +58,25 @@ def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> 
     because re-exporting them produces byte-different output even when
     the content hasn't changed.
 
-    Returns the number of files synced.
+    Returns a dict with 'count' (files synced) and 'debug' diagnostics.
     """
     cfg = get_config()
+    debug: dict[str, object] = {"folder_id": cfg.drive_folder_id}
 
     all_files = drive.list_all_files()
+    debug["files_listed"] = len(all_files)
+
+    if force:
+        logger.info("Force flag set — clearing tracked file state")
+        state.clear_all_files()
+
     if not all_files:
         logger.info("No files found in Drive folder")
-        return 0
+        return {"count": 0, "debug": debug}
 
     # Build Change objects, skipping files already tracked in Firestore
     changes: list[Change] = []
+    already_tracked = 0
     for file_data in all_files:
         file_id = file_data["id"]
 
@@ -88,10 +98,12 @@ def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> 
             md5 = file_data.get("md5Checksum")
             if md5:
                 if md5 == existing.get("md5"):
+                    already_tracked += 1
                     continue
             else:
                 # Google-native file — compare modifiedTime
                 if file_data.get("modifiedTime") == existing.get("modified_time"):
+                    already_tracked += 1
                     continue
 
         last_user = file_data.get("lastModifyingUser", {})
@@ -108,7 +120,8 @@ def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> 
 
     if not changes:
         logger.info("All files already tracked — nothing to sync")
-        return 0
+        debug["already_tracked"] = already_tracked
+        return {"count": 0, "debug": debug}
 
     logger.info(f"Initial sync: {len(changes)} files to process")
 
@@ -148,7 +161,8 @@ def run_initial_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> 
             update_file_state(change, state)
 
     logger.info(f"Initial sync complete: {len(processed)} files committed")
-    return len(processed)
+    debug["files_synced"] = len(processed)
+    return {"count": len(processed), "debug": debug}
 
 
 def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:

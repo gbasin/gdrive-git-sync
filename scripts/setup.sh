@@ -1367,7 +1367,29 @@ else
       if [ -n "$SYNC_COUNT" ] && [ "$SYNC_COUNT" != "0" ]; then
         ok "Initial sync complete: $SYNC_COUNT files committed to git"
       elif [ "$SYNC_COUNT" = "0" ]; then
-        hint "No new files to sync (folder empty or already up-to-date)"
+        FILES_LISTED=$(echo "$WATCH_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('initial_sync_debug',{}).get('files_listed','?'))" 2>/dev/null || echo "?")
+        if [ "$FILES_LISTED" = "0" ]; then
+          warn "No files visible to the service account in Drive folder."
+          hint "Check that the folder is shared with $SA_EMAIL (Editor role)."
+          hint "Subfolders are traversed automatically — this likely means the"
+          hint "service account doesn't have access to the folder."
+        elif [ "$FILES_LISTED" != "?" ] && [ "$FILES_LISTED" -gt 0 ] 2>/dev/null; then
+          # Files exist in Drive but Firestore thinks they're already tracked.
+          # Likely stale state from a previous failed run — retry with force.
+          hint "Drive has $FILES_LISTED files but state says already synced — retrying with reset..."
+          printf "  ⏳ Re-syncing with fresh state..."
+          WATCH_RESULT=$(curl -s -X POST "${SETUP_URL}?initial_sync=true&force=true" \
+            -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
+          printf "\r\033[2K"
+          SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
+          if [ -n "$SYNC_COUNT" ] && [ "$SYNC_COUNT" != "0" ]; then
+            ok "Initial sync complete: $SYNC_COUNT files committed to git"
+          else
+            warn "Sync returned 0 files after reset. Check Cloud Function logs."
+          fi
+        else
+          hint "No new files to sync (folder empty or already up-to-date)"
+        fi
       fi
     else
       ERR=$(json_error "$WATCH_RESULT")

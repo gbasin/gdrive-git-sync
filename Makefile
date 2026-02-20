@@ -1,3 +1,4 @@
+.SUFFIXES:            # disable built-in suffix rules (prevents .sh → executable copies)
 .PHONY: install lint lint-shell format typecheck test test-shell ci deploy setup clean lock
 
 install:
