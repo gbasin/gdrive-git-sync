@@ -94,7 +94,8 @@ class TestClone:
 
         git_repo.clone()
 
-        args = mock_run.call_args[0][0]
+        # First call is the clone; subsequent calls are _configure_identity
+        args = mock_run.call_args_list[0][0][0]
         assert args[0] == "git"
         assert args[1] == "clone"
         assert "--filter=blob:none" in args
@@ -109,8 +110,8 @@ class TestClone:
 
         git_repo.clone()
 
-        # cwd should be work_dir (not repo_path)
-        assert mock_run.call_args[1]["cwd"] == git_repo.work_dir
+        # First call (clone) cwd should be work_dir (not repo_path)
+        assert mock_run.call_args_list[0][1]["cwd"] == git_repo.work_dir
 
 
 # ---------------------------------------------------------------------------
