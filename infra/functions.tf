@@ -7,21 +7,25 @@ resource "google_storage_bucket_object" "functions_source" {
 
 # Common environment variables (without SYNC_HANDLER_URL to avoid circular ref)
 locals {
-  common_env = {
-    GCP_PROJECT               = var.gcp_project
-    DRIVE_FOLDER_ID           = var.drive_folder_id
-    GIT_REPO_URL              = var.git_repo_url
-    GIT_BRANCH                = var.git_branch
-    GIT_TOKEN_SECRET          = var.git_token_secret
-    EXCLUDE_PATHS             = var.exclude_paths
-    SKIP_EXTENSIONS           = var.skip_extensions
-    MAX_FILE_SIZE_MB          = tostring(var.max_file_size_mb)
-    COMMIT_AUTHOR_NAME        = var.commit_author_name
-    COMMIT_AUTHOR_EMAIL       = var.commit_author_email
-    FIRESTORE_COLLECTION      = var.firestore_collection
-    DOCS_SUBDIR               = var.docs_subdir
-    GOOGLE_VERIFICATION_TOKEN = var.google_verification_token
-  }
+  common_env = merge(
+    {
+      GCP_PROJECT               = var.gcp_project
+      DRIVE_FOLDER_ID           = var.drive_folder_id
+      GIT_REPO_URL              = var.git_repo_url
+      GIT_BRANCH                = var.git_branch
+      GIT_TOKEN_SECRET          = var.git_token_secret
+      EXCLUDE_PATHS             = var.exclude_paths
+      SKIP_EXTENSIONS           = var.skip_extensions
+      MAX_FILE_SIZE_MB          = tostring(var.max_file_size_mb)
+      COMMIT_AUTHOR_NAME        = var.commit_author_name
+      COMMIT_AUTHOR_EMAIL       = var.commit_author_email
+      FIRESTORE_COLLECTION      = var.firestore_collection
+      GOOGLE_VERIFICATION_TOKEN = var.google_verification_token
+    },
+    # Only set DOCS_SUBDIR when explicitly configured — empty means
+    # "auto-resolve from Drive folder name" which the function handles.
+    var.docs_subdir != "" ? { DOCS_SUBDIR = var.docs_subdir } : {},
+  )
 }
 
 # === sync_handler: webhook receiver (public, unauthenticated) ===
