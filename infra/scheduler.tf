@@ -12,6 +12,7 @@ resource "google_cloud_scheduler_job" "renew_watch" {
 
     oidc_token {
       service_account_email = google_service_account.sync.email
+      audience              = google_cloudfunctions2_function.renew_watch.service_config[0].uri
     }
   }
 }
@@ -28,9 +29,10 @@ resource "google_cloud_scheduler_job" "safety_net" {
     http_method = "POST"
     uri         = google_cloudfunctions2_function.sync_handler.url
 
-    # sync_handler is public, but scheduler can still send authenticated requests
+    # sync_handler is public, but set audience explicitly for consistency
     oidc_token {
       service_account_email = google_service_account.sync.email
+      audience              = google_cloudfunctions2_function.sync_handler.service_config[0].uri
     }
   }
 }

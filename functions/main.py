@@ -45,17 +45,20 @@ def sync_handler(request: Request):
         channel_id = request.headers.get("X-Goog-Channel-ID", "")
         resource_state = request.headers.get("X-Goog-Resource-State", "")
 
-        logger.info(f"Webhook received: state={resource_state}, channel={channel_id[:8]}...")
+        channel_display = channel_id[:8] + "..." if channel_id else "<none>"
+        logger.info(f"Webhook received: state={resource_state}, channel={channel_display}")
 
         # "sync" state is the initial validation ping — just ACK it
         if resource_state == "sync":
             logger.info("Received sync validation ping")
             return "OK", 200
 
-        # Validate channel ID matches our stored channel
+        # Validate channel ID matches our stored channel.
+        # Requests without a channel ID (e.g. Cloud Scheduler safety-net,
+        # manual curl) are allowed through — only reject mismatches.
         state = StateManager()
         watch_info = state.get_watch_channel()
-        if watch_info and watch_info.get("channel_id") != channel_id:
+        if channel_id and watch_info and watch_info.get("channel_id") != channel_id:
             logger.warning(f"Unknown channel ID: {channel_id}")
             return "OK", 200
 

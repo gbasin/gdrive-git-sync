@@ -67,9 +67,10 @@ resource "google_cloudfunctions2_function" "sync_handler" {
 # IAM entirely, so org policies don't interfere.
 #
 # Security: the function validates webhook requests by matching the
-# X-Goog-Channel-ID header against the stored channel ID — unknown
-# channels are rejected. The Cloud Run URL is also an unguessable
-# random domain. This is equivalent security to the allUsers IAM approach.
+# X-Goog-Channel-ID header against the stored channel ID — mismatched
+# channels are rejected. Requests without a channel ID (e.g. Cloud
+# Scheduler safety-net, manual triggers) are allowed through.
+# The Cloud Run URL is also an unguessable random domain.
 resource "null_resource" "sync_handler_no_iam_check" {
   triggers = {
     service_id = google_cloudfunctions2_function.sync_handler.id

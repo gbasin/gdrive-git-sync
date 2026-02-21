@@ -22,6 +22,24 @@ resource "google_project_iam_member" "secret_accessor" {
   member  = "serviceAccount:${google_service_account.sync.email}"
 }
 
+# Allow Cloud Scheduler (via its OIDC token) to invoke the
+# renew_watch and setup_watch Cloud Run services.
+resource "google_cloud_run_service_iam_member" "scheduler_invoke_renew" {
+  service  = google_cloudfunctions2_function.renew_watch.name
+  location = var.region
+  project  = var.gcp_project
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.sync.email}"
+}
+
+resource "google_cloud_run_service_iam_member" "scheduler_invoke_setup" {
+  service  = google_cloudfunctions2_function.setup_watch.name
+  location = var.region
+  project  = var.gcp_project
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.sync.email}"
+}
+
 # Cloud Functions Gen2 uses Cloud Build to build container images.
 # The default compute SA needs this role or the build step fails.
 resource "google_project_iam_member" "cloudbuild_builder" {
