@@ -68,9 +68,9 @@ variable "firestore_collection" {
 }
 
 variable "docs_subdir" {
-  description = "Subdirectory in git repo for synced files"
+  description = "Subdirectory in git repo for synced files (empty = Drive folder name)"
   type        = string
-  default     = "docs"
+  default     = ""
 }
 
 variable "google_verification_token" {

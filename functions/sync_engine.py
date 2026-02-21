@@ -43,6 +43,18 @@ class AuthorCommit:
     files: list["Change"] = field(default_factory=list)
 
 
+def _resolve_docs_subdir(drive: DriveClient, cfg) -> None:
+    """If DOCS_SUBDIR is not explicitly set, default to the Drive folder name."""
+    if cfg.docs_subdir:
+        return  # explicitly configured — leave it alone
+    folder_name = drive.get_folder_name(cfg.drive_folder_id)
+    if folder_name:
+        cfg.docs_subdir = folder_name
+        logger.info(f"Using Drive folder name as subdir: {folder_name}")
+    else:
+        logger.warning("Could not resolve Drive folder name — files will sync to repo root")
+
+
 def run_initial_sync(
     drive: DriveClient, state: StateManager, repo: GitRepo, *, force: bool = False,
 ) -> dict[str, object]:
@@ -61,6 +73,7 @@ def run_initial_sync(
     Returns a dict with 'count' (files synced) and 'debug' diagnostics.
     """
     cfg = get_config()
+    _resolve_docs_subdir(drive, cfg)
     debug: dict[str, object] = {"folder_id": cfg.drive_folder_id}
 
     all_files = drive.list_all_files()
@@ -168,6 +181,7 @@ def run_initial_sync(
 def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     """Execute a full sync cycle. Returns number of changes processed."""
     cfg = get_config()
+    _resolve_docs_subdir(drive, cfg)
 
     # Get current page token
     page_token = state.get_page_token()

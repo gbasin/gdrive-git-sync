@@ -166,7 +166,7 @@ class DriveClient:
 
         current_parent = parents[0]
         while current_parent and current_parent != self.cfg.drive_folder_id:
-            folder_name = self._get_folder_name(current_parent)
+            folder_name = self.get_folder_name(current_parent)
             if folder_name is None:
                 break
             parts.append(folder_name)
@@ -182,7 +182,7 @@ class DriveClient:
         parts.append(name)
         return "/".join(parts)
 
-    def _get_folder_name(self, folder_id: str) -> str | None:
+    def get_folder_name(self, folder_id: str) -> str | None:
         if folder_id in self._folder_cache:
             return self._folder_cache[folder_id]
         try:

@@ -23,7 +23,7 @@ class Config:
         self.commit_author_name = os.environ.get("COMMIT_AUTHOR_NAME", "Drive Sync Bot")
         self.commit_author_email = os.environ.get("COMMIT_AUTHOR_EMAIL", "sync@example.com")
         self.firestore_collection = os.environ.get("FIRESTORE_COLLECTION", "drive_sync_state")
-        self.docs_subdir = os.environ.get("DOCS_SUBDIR", "docs")
+        self.docs_subdir = os.environ.get("DOCS_SUBDIR", "")
 
     def _require(self, name: str) -> str:
         value = os.environ.get(name)
