@@ -70,12 +70,13 @@ docs/
 make setup
 ```
 
+`make setup` is a thin wrapper for `./scripts/setup.sh`.
+
 The interactive setup installs missing tools via brew, creates your `.env`, creates a GCP project (or uses an existing one), links billing, enables APIs, deploys infrastructure, and stores your git token. It's crash-safe and idempotent — if anything fails, re-run and it picks up where it left off.
 
 **Dry run** — preview every step without executing anything:
 
 ```bash
-make setup             # then choose --dry-run when prompted
 ./scripts/setup.sh --dry-run
 ```
 
@@ -93,6 +94,8 @@ To redeploy after code changes:
 ```bash
 make deploy
 ```
+
+`make deploy` is a thin wrapper for `./scripts/deploy.sh`.
 
 <details>
 <summary>Manual setup (step-by-step)</summary>
