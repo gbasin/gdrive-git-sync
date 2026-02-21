@@ -21,6 +21,7 @@ locals {
       COMMIT_AUTHOR_EMAIL       = var.commit_author_email
       FIRESTORE_COLLECTION      = var.firestore_collection
       GOOGLE_VERIFICATION_TOKEN = var.google_verification_token
+      SYNC_TRIGGER_SECRET       = var.sync_trigger_secret
     },
     # Only set DOCS_SUBDIR when explicitly configured — empty means
     # "auto-resolve from Drive folder name" which the function handles.
@@ -69,7 +70,7 @@ resource "google_cloudfunctions2_function" "sync_handler" {
 # Security: the function validates webhook requests by matching the
 # X-Goog-Channel-ID header against the stored channel ID — mismatched
 # channels are rejected. Requests without a channel ID (e.g. Cloud
-# Scheduler safety-net, manual triggers) are allowed through.
+# Scheduler safety-net, manual triggers) must present X-Sync-Trigger-Secret.
 # The Cloud Run URL is also an unguessable random domain.
 resource "null_resource" "sync_handler_no_iam_check" {
   triggers = {

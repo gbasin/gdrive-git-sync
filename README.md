@@ -168,6 +168,7 @@ curl -X POST "$(terraform -chdir=infra output -raw setup_watch_url)?initial_sync
 | `COMMIT_AUTHOR_EMAIL` | No | `sync@example.com` | Fallback commit email |
 | `FIRESTORE_COLLECTION` | No | `drive_sync_state` | Firestore collection name |
 | `DOCS_SUBDIR` | No | `docs` | Subdirectory in git repo |
+| `SYNC_TRIGGER_SECRET` | No | auto-generated in `make deploy` if unset | Required for channel-less manual/scheduler sync triggers |
 
 ## Extraction details
 
@@ -281,7 +282,7 @@ Beyond free tier, costs scale with Drive activity. See [GCP pricing](https://clo
 
 - **Service account** — Gets read-only access to the monitored Drive folder plus Firestore read/write. No broader GCP permissions.
 - **Git token** — Stored in Secret Manager, never in environment variables or source code. The Cloud Function reads it at runtime.
-- **Webhook endpoint** — Cloud Functions (2nd gen) runs on Cloud Run, which is authenticated by default. Google's Drive API validates the webhook URL via domain verification.
+- **Webhook endpoint** — Public for Drive push notifications, but sync requests without Drive channel headers are gated by `X-Sync-Trigger-Secret` to prevent unauthenticated trigger abuse.
 - **No data storage beyond** — Firestore holds only page tokens, lock state, and watch channel metadata. File contents pass through the function transiently and land only in the git repo.
 
 ## Limitations
@@ -312,7 +313,7 @@ Then clean up:
 **Watch channel not receiving notifications**
 - Verify domain ownership is complete in both Search Console and API Console
 - Check that the service account has access to the Drive folder
-- Run the safety-net sync manually: `curl -X POST <sync_handler_url>`
+- Run the safety-net sync manually: `curl -X POST <sync_handler_url> -H "X-Sync-Trigger-Secret: $SYNC_TRIGGER_SECRET"`
 
 **Files not syncing**
 - Check Cloud Function logs: `gcloud functions logs read drive-sync-handler --gen2 --limit=50`

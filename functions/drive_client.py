@@ -151,9 +151,10 @@ class DriveClient:
                     elif f.get("mimeType") == SHORTCUT_MIME:
                         target_mime = f.get("shortcutDetails", {}).get("targetMimeType")
                         if target_mime == FOLDER_MIME:
-                            # Shortcut to folder — recurse into the target
-                            target_id = f["shortcutDetails"]["targetId"]
-                            queue.append(target_id)
+                            # Skip folder shortcuts in initial sync. Their target
+                            # tree is outside the monitored parent chain and can
+                            # cause add/delete churn in delta sync classification.
+                            logger.info(f"Skipping folder shortcut in initial sync: {f.get('name')}")
                         else:
                             # Shortcut to file — resolve and add
                             resolved = self.resolve_shortcut(f)

@@ -277,6 +277,15 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
                 change_type=ChangeType.DELETE,
                 old_path=existing.get("path"),
             )
+        # Target file for a tracked shortcut may be deleted/trashed.
+        result = state.get_file_by_target(file_id)
+        if result:
+            shortcut_id, shortcut_state = result
+            return Change(
+                file_id=shortcut_id,
+                change_type=ChangeType.DELETE,
+                old_path=shortcut_state.get("path"),
+            )
         return None  # Unknown file deleted, nothing to do
 
     # Resolve shortcuts — replace file_data with target metadata
@@ -301,6 +310,13 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
         if result:
             shortcut_id, shortcut_state = result
             merged = dict(file_data)
+            merged["id"] = shortcut_id
+            shortcut_name = shortcut_state.get("name")
+            if not shortcut_name:
+                shortcut_path = shortcut_state.get("path", "")
+                shortcut_name = os.path.basename(shortcut_path) if shortcut_path else ""
+            if shortcut_name:
+                merged["name"] = shortcut_name
             merged["_target_id"] = file_id
             return Change(
                 file_id=shortcut_id,

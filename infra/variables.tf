@@ -79,6 +79,12 @@ variable "google_verification_token" {
   default     = ""
 }
 
+variable "sync_trigger_secret" {
+  description = "Shared secret required for channel-less sync triggers (Scheduler/manual)"
+  type        = string
+  default     = ""
+}
+
 variable "functions_source_bucket" {
   description = "GCS bucket for Cloud Functions source code"
   type        = string

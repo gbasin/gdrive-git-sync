@@ -28,8 +28,12 @@ resource "google_cloud_scheduler_job" "safety_net" {
   http_target {
     http_method = "POST"
     uri         = google_cloudfunctions2_function.sync_handler.url
+    headers = {
+      "X-Sync-Trigger-Secret" = var.sync_trigger_secret
+    }
 
-    # sync_handler is public, but set audience explicitly for consistency
+    # sync_handler is public, but scheduler requests are still authenticated
+    # and include a shared trigger secret for channel-less sync safety.
     oidc_token {
       service_account_email = google_service_account.sync.email
       audience              = google_cloudfunctions2_function.sync_handler.service_config[0].uri

@@ -42,7 +42,9 @@ def mock_drive():
 @pytest.fixture
 def mock_state():
     """Create a mock StateManager."""
-    return MagicMock()
+    state = MagicMock()
+    state.get_file_by_target.return_value = None
+    return state
 
 
 def _make_file_data(
@@ -239,10 +241,43 @@ class TestClassifyChange:
         from sync_engine import classify_change
 
         mock_state.get_file.return_value = None
+        mock_state.get_file_by_target.return_value = None
         raw = {"removed": True, "file": {}}
 
         result = classify_change("fileId1", raw, mock_drive, mock_state)
         assert result is None
+
+    def test_removed_target_file_deletes_tracked_shortcut(self, mock_drive, mock_state):
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = None
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Reports/link.docx", "name": "link.docx"},
+        )
+        raw = {"removed": True, "file": {}}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+        assert result is not None
+        assert result.change_type == ChangeType.DELETE
+        assert result.file_id == "shortcut1"
+        assert result.old_path == "Reports/link.docx"
+
+    def test_trashed_target_file_deletes_tracked_shortcut(self, mock_drive, mock_state):
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = None
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Reports/link.docx", "name": "link.docx"},
+        )
+        raw = {"file": {"trashed": True}}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+        assert result is not None
+        assert result.change_type == ChangeType.DELETE
+        assert result.file_id == "shortcut1"
+        assert result.old_path == "Reports/link.docx"
 
     def test_excluded_file_returns_none(self, mock_drive, mock_state):
         from sync_engine import classify_change
@@ -1838,6 +1873,8 @@ class TestClassifyChangeShortcuts:
         assert result is not None
         assert result.change_type == ChangeType.MODIFY
         assert result.file_id == "shortcut1"
+        assert result.file_data["id"] == "shortcut1"
+        assert result.file_data["name"] == "link.docx"
         assert result.file_data["_target_id"] == "target1"
         assert result.new_path == "Reports/link.docx"
 

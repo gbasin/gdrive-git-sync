@@ -34,6 +34,15 @@ fi
 : "${DRIVE_FOLDER_ID:?DRIVE_FOLDER_ID is required in .env}"
 : "${GIT_REPO_URL:?GIT_REPO_URL is required in .env}"
 
+if [ -z "${SYNC_TRIGGER_SECRET:-}" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    SYNC_TRIGGER_SECRET="$(openssl rand -hex 32)"
+  else
+    SYNC_TRIGGER_SECRET="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  echo "ℹ️  SYNC_TRIGGER_SECRET not set in .env; generated one for this deploy."
+fi
+
 # ── Generate terraform.tfvars ────────────────────────────────────────
 echo "=== Generating terraform.tfvars ==="
 
@@ -44,6 +53,7 @@ drive_folder_id         = "${DRIVE_FOLDER_ID}"
 git_repo_url            = "${GIT_REPO_URL}"
 git_branch              = "${GIT_BRANCH:-main}"
 git_token_secret        = "${GIT_TOKEN_SECRET:-git-token}"
+sync_trigger_secret     = "${SYNC_TRIGGER_SECRET}"
 functions_source_bucket = "${GCP_PROJECT}-functions-source"
 EOF
 

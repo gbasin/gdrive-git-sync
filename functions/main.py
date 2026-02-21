@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 VERIFICATION_TOKEN = os.environ.get("GOOGLE_VERIFICATION_TOKEN", "")
 
 
+def _has_valid_channelless_trigger_secret(request: Request) -> bool:
+    """Validate auth for scheduler/manual requests without Drive channel headers."""
+    expected_secret = os.environ.get("SYNC_TRIGGER_SECRET", "").strip()
+    if not expected_secret:
+        logger.error("SYNC_TRIGGER_SECRET is not configured; rejecting channel-less trigger")
+        return False
+
+    provided_secret = request.headers.get("X-Sync-Trigger-Secret", "")
+    if provided_secret != expected_secret:
+        logger.warning("Rejected channel-less trigger with invalid secret")
+        return False
+
+    return True
+
+
 @functions_framework.http
 def sync_handler(request: Request):
     """Receive Drive push notifications and sync changes to git.
@@ -54,12 +69,15 @@ def sync_handler(request: Request):
             return "OK", 200
 
         # Validate channel ID matches our stored channel.
-        # Requests without a channel ID (e.g. Cloud Scheduler safety-net,
-        # manual curl) are allowed through — only reject mismatches.
         state = StateManager()
         watch_info = state.get_watch_channel()
         if channel_id and watch_info and watch_info.get("channel_id") != channel_id:
             logger.warning(f"Unknown channel ID: {channel_id}")
+            return "OK", 200
+
+        # Requests without Drive channel headers must present a shared
+        # trigger secret (used by Cloud Scheduler safety-net/manual runs).
+        if not channel_id and not _has_valid_channelless_trigger_secret(request):
             return "OK", 200
 
         # Try to acquire lock

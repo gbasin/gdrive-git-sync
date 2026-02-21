@@ -4,7 +4,7 @@ StateManager, DriveClient, GitRepo, and run_sync are mocked throughout.
 Flask Request objects are built using Werkzeug's test helpers.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from werkzeug.test import EnvironBuilder
@@ -24,6 +24,7 @@ def _set_env(monkeypatch):
     monkeypatch.setenv("GIT_REPO_URL", "https://github.com/test/repo.git")
     monkeypatch.setenv("GIT_BRANCH", "main")
     monkeypatch.setenv("GIT_TOKEN_SECRET", "git-token")
+    monkeypatch.setenv("SYNC_TRIGGER_SECRET", "test-trigger-secret")
     reset_config()
 
 
@@ -41,12 +42,13 @@ def _make_request(method="POST", headers=None):
 class TestSyncHandlerChannelValidation:
     """Tests for X-Goog-Channel-ID validation logic in sync_handler."""
 
-    def test_no_channel_id_proceeds_to_sync(self):
-        """Request with no X-Goog-Channel-ID header should acquire lock and sync."""
+    def test_no_channel_id_with_valid_secret_proceeds_to_sync(self):
+        """Channel-less request with valid trigger secret should sync."""
         from main import sync_handler
 
         request = _make_request(headers={
             "X-Goog-Resource-State": "update",
+            "X-Sync-Trigger-Secret": "test-trigger-secret",
         })
 
         with (
@@ -65,6 +67,31 @@ class TestSyncHandlerChannelValidation:
         assert status == 200
         mock_state.acquire_lock.assert_called_once()
         mock_loop.assert_called_once()
+
+    def test_no_channel_id_without_secret_does_not_sync(self):
+        """Channel-less request without trigger secret should be rejected."""
+        from main import sync_handler
+
+        request = _make_request(headers={
+            "X-Goog-Resource-State": "update",
+        })
+
+        with (
+            patch("main.StateManager") as MockState,
+            patch("main._run_sync_loop") as mock_loop,
+        ):
+            mock_state = MockState.return_value
+            mock_state.get_watch_channel.return_value = {
+                "channel_id": "stored-channel-id",
+                "resource_id": "res1",
+            }
+
+            body, status = sync_handler(request)
+
+        assert status == 200
+        assert body == "OK"
+        mock_state.acquire_lock.assert_not_called()
+        mock_loop.assert_not_called()
 
     def test_matching_channel_id_proceeds_to_sync(self):
         """Request with a channel ID that matches the stored one should sync."""
