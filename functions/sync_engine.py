@@ -56,7 +56,11 @@ def _resolve_docs_subdir(drive: DriveClient, cfg) -> None:
 
 
 def run_initial_sync(
-    drive: DriveClient, state: StateManager, repo: GitRepo, *, force: bool = False,
+    drive: DriveClient,
+    state: StateManager,
+    repo: GitRepo,
+    *,
+    force: bool = False,
 ) -> dict[str, object]:
     """Full folder listing + download for existing Drive files.
 

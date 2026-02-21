@@ -1,8 +1,12 @@
 MAKEFLAGS += -r       # disable built-in implicit rules (.SUFFIXES: alone doesn't work on Make 3.81)
-.PHONY: install lint lint-shell format typecheck test test-shell ci deploy setup clean lock
+.PHONY: install install-hooks lint lint-shell format typecheck test test-shell ci deploy setup clean lock
 
 install:
 	uv sync --all-extras
+	uv run pre-commit install
+
+install-hooks:
+	uv run pre-commit install
 
 lock:
 	uv lock

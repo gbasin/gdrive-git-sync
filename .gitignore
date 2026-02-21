@@ -37,6 +37,7 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+.cache/
 
 # Deployment
 functions_source.zip

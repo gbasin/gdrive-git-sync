@@ -61,9 +61,7 @@ class DriveClient:
 
         try:
             target = (
-                self.service.files()
-                .get(fileId=target_id, fields=LIST_FILE_FIELDS, supportsAllDrives=True)
-                .execute()
+                self.service.files().get(fileId=target_id, fields=LIST_FILE_FIELDS, supportsAllDrives=True).execute()
             )
         except Exception:
             logger.warning(f"Cannot access shortcut target {target_id} for {file_data.get('name')}")
@@ -222,7 +220,11 @@ class DriveClient:
             parts.append(folder_name)
             # Get parent of parent
             try:
-                parent_file = self.service.files().get(fileId=current_parent, fields="name,parents", supportsAllDrives=True).execute()
+                parent_file = (
+                    self.service.files()
+                    .get(fileId=current_parent, fields="name,parents", supportsAllDrives=True)
+                    .execute()
+                )
                 parent_parents = parent_file.get("parents", [])
                 current_parent = parent_parents[0] if parent_parents else None
             except Exception:

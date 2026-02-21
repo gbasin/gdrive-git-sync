@@ -230,7 +230,7 @@ make ci
 uv run pre-commit install
 ```
 
-This runs ruff (lint + format) and mypy on every commit.
+`make install` now installs these hooks automatically. Once installed, each commit auto-runs Ruff lint autofixes (`--fix`) and Ruff formatting, plus mypy.
 
 ### Project structure
 
