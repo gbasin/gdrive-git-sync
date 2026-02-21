@@ -63,6 +63,11 @@ class GitRepo:
             raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
         return result.stdout
 
+    def _configure_identity(self):
+        """Set committer identity (Cloud Functions has no global git config)."""
+        self._run(["git", "config", "user.name", self.cfg.commit_author_name])
+        self._run(["git", "config", "user.email", self.cfg.commit_author_email])
+
     def clone(self):
         """Clone the repo with partial clone (blob filter)."""
         auth_url = self._auth_url()
@@ -70,6 +75,7 @@ class GitRepo:
             ["git", "clone", "--filter=blob:none", "--branch", self.cfg.git_branch, auth_url, self.repo_path],
             cwd=self.work_dir,
         )
+        self._configure_identity()
         logger.info(f"Cloned repo to {self.repo_path}")
 
     def clone_or_init(self):
@@ -103,6 +109,7 @@ class GitRepo:
                 cwd=self.work_dir,
             )
             self._run(["git", "checkout", "-b", self.cfg.git_branch])
+        self._configure_identity()
         logger.info(f"Cloned repo to {self.repo_path}")
 
     def write_file(self, rel_path: str, content: bytes):

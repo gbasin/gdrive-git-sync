@@ -1510,11 +1510,10 @@ else
 
     elif [ "$WATCH_HTTP" = "500" ]; then
       warn "Function returned an internal error after $WATCH_MAX attempts."
-      hint "This usually means domain verification hasn't propagated yet."
-      hint "Wait a minute and re-run: make setup"
-      echo ""
-      hint "If it keeps failing, check the logs:"
+      hint "Check the logs to see what went wrong:"
       echo -e "    gcloud functions logs read drive-sync-setup-watch --region=$REGION --limit=20"
+      echo ""
+      hint "Then re-run: make setup"
 
     else
       ERR=$(json_error "$WATCH_RESULT")
