@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 from config import get_config
-from drive_client import DriveClient
+from drive_client import SHORTCUT_MIME, DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
 from text_extractor import GOOGLE_NATIVE_EXPORTS as NATIVE_EXPORTS
@@ -264,7 +264,8 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
     trashed = file_data.get("trashed", False)
     existing = state.get_file(file_id)
 
-    # File removed or trashed
+    # File removed or trashed — check before resolving shortcuts to avoid
+    # a wasted API call fetching the target of a deleted shortcut.
     if removed or trashed:
         if existing:
             return Change(
@@ -274,6 +275,14 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
             )
         return None  # Unknown file deleted, nothing to do
 
+    # Resolve shortcuts — replace file_data with target metadata
+    if file_data.get("mimeType") == SHORTCUT_MIME:
+        resolved = drive.resolve_shortcut(file_data)
+        if not resolved:
+            logger.warning(f"Broken shortcut {file_id} — skipping")
+            return None
+        file_data = resolved
+
     # Check if file is in monitored folder
     if not drive.is_in_folder(file_data):
         if existing:
@@ -282,6 +291,20 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
                 file_id=file_id,
                 change_type=ChangeType.DELETE,
                 old_path=existing.get("path"),
+            )
+        # Check if this is a shortcut target we're tracking
+        result = state.get_file_by_target(file_id)
+        if result:
+            shortcut_id, shortcut_state = result
+            merged = dict(file_data)
+            merged["_target_id"] = file_id
+            return Change(
+                file_id=shortcut_id,
+                change_type=ChangeType.MODIFY,
+                file_data=merged,
+                new_path=shortcut_state.get("path"),
+                author_name=file_data.get("lastModifyingUser", {}).get("displayName"),
+                author_email=file_data.get("lastModifyingUser", {}).get("emailAddress"),
             )
         return None  # Not our file
 
@@ -461,17 +484,18 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
     assert change.new_path is not None
     mime_type = file_data.get("mimeType", "")
     name = file_data.get("name", "unknown")
+    download_id = file_data.get("_target_id", change.file_id)
 
     # Determine if Google-native and needs export
     if mime_type in NATIVE_EXPORTS:
         fmt, ext, export_mime = NATIVE_EXPORTS[mime_type]
-        content = drive.export_file(change.file_id, export_mime)
+        content = drive.export_file(download_id, export_mime)
         # For Google-native, the "original" is the export (e.g., .docx, .csv)
         exported_name = name + ext
         dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
         original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
     else:
-        content = drive.download_file(change.file_id)
+        content = drive.download_file(download_id)
         original_path = change.new_path
 
     # Write original to repo
@@ -582,16 +606,18 @@ def update_file_state(change: Change, state: StateManager):
 
     last_user = file_data.get("lastModifyingUser", {})
 
-    state.set_file(
-        change.file_id,
-        {
-            "name": name,
-            "path": path,
-            "md5": file_data.get("md5Checksum"),
-            "mime_type": mime_type,
-            "modified_time": file_data.get("modifiedTime"),
-            "extracted_path": extracted_path,
-            "last_modified_by_name": last_user.get("displayName"),
-            "last_modified_by_email": last_user.get("emailAddress"),
-        },
-    )
+    state_data = {
+        "name": name,
+        "path": path,
+        "md5": file_data.get("md5Checksum"),
+        "mime_type": mime_type,
+        "modified_time": file_data.get("modifiedTime"),
+        "extracted_path": extracted_path,
+        "last_modified_by_name": last_user.get("displayName"),
+        "last_modified_by_email": last_user.get("emailAddress"),
+    }
+    target_id = file_data.get("_target_id")
+    if target_id:
+        state_data["target_id"] = target_id
+
+    state.set_file(change.file_id, state_data)

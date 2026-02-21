@@ -172,6 +172,7 @@ class TestClassifyChange:
         from sync_engine import classify_change
 
         mock_state.get_file.return_value = None
+        mock_state.get_file_by_target.return_value = None
         mock_drive.is_in_folder.return_value = False
         file_data = _make_file_data()
         raw = {"file": file_data}
@@ -1715,3 +1716,290 @@ class TestHandleRenameWithContentChange:
         mock_extract.assert_called_once()
         # Re-exported file written to repo
         assert mock_repo.write_file.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Shortcut support
+# ---------------------------------------------------------------------------
+
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+
+
+def _make_shortcut_data(
+    shortcut_id="shortcut1",
+    name="link.docx",
+    target_id="target1",
+    target_mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    parents=None,
+):
+    """Helper to build a shortcut file_data dict."""
+    return {
+        "id": shortcut_id,
+        "name": name,
+        "mimeType": SHORTCUT_MIME,
+        "trashed": False,
+        "parents": parents or ["folder123"],
+        "shortcutDetails": {
+            "targetId": target_id,
+            "targetMimeType": target_mime,
+        },
+        "lastModifyingUser": {
+            "displayName": "Alice",
+            "emailAddress": "alice@example.com",
+        },
+    }
+
+
+class TestClassifyChangeShortcuts:
+    """Tests for shortcut handling in classify_change."""
+
+    def test_shortcut_resolved_and_classified_as_add(self, mock_drive, mock_state):
+        """A new shortcut in our folder should resolve and be classified as ADD."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = None  # new file
+        mock_drive.resolve_shortcut.return_value = {
+            "id": "shortcut1",
+            "name": "link.docx",
+            "parents": ["folder123"],
+            "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "md5Checksum": "target_md5",
+            "modifiedTime": "2025-01-01T00:00:00Z",
+            "_target_id": "target1",
+            "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@example.com"},
+        }
+        raw = {"file": _make_shortcut_data()}
+
+        result = classify_change("shortcut1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.ADD
+        assert result.file_id == "shortcut1"
+        assert result.file_data["_target_id"] == "target1"
+        assert result.file_data["mimeType"] != SHORTCUT_MIME
+
+    def test_broken_shortcut_returns_none(self, mock_drive, mock_state):
+        """A shortcut whose target is inaccessible should be skipped."""
+        from sync_engine import classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.resolve_shortcut.return_value = None
+        raw = {"file": _make_shortcut_data()}
+
+        result = classify_change("shortcut1", raw, mock_drive, mock_state)
+        assert result is None
+
+    def test_trashed_shortcut_skips_resolution(self, mock_drive, mock_state):
+        """A trashed shortcut should NOT call resolve_shortcut (avoids wasted API call)."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = {"path": "link.docx", "name": "link.docx"}
+        shortcut_data = _make_shortcut_data()
+        shortcut_data["trashed"] = True
+        raw = {"file": shortcut_data}
+
+        result = classify_change("shortcut1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.DELETE
+        # resolve_shortcut should NOT have been called
+        mock_drive.resolve_shortcut.assert_not_called()
+
+    def test_removed_shortcut_skips_resolution(self, mock_drive, mock_state):
+        """A removed shortcut should NOT call resolve_shortcut."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = {"path": "link.docx", "name": "link.docx"}
+        raw = {"removed": True, "file": _make_shortcut_data()}
+
+        result = classify_change("shortcut1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.DELETE
+        mock_drive.resolve_shortcut.assert_not_called()
+
+    def test_target_file_change_triggers_shortcut_modify(self, mock_drive, mock_state):
+        """When a shortcut target is modified, detect it via reverse-lookup."""
+        from sync_engine import ChangeType, classify_change
+
+        # Target file is not directly tracked
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Reports/link.docx", "name": "link.docx"},
+        )
+
+        target_file_data = _make_file_data(md5="new_md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.MODIFY
+        assert result.file_id == "shortcut1"
+        assert result.file_data["_target_id"] == "target1"
+        assert result.new_path == "Reports/link.docx"
+
+    def test_target_change_does_not_mutate_raw_dict(self, mock_drive, mock_state):
+        """The target-change path should copy file_data, not mutate the raw dict."""
+        from sync_engine import classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "link.docx", "name": "link.docx"},
+        )
+
+        target_file_data = _make_file_data(md5="new_md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        # The Change's file_data should have _target_id
+        assert result.file_data["_target_id"] == "target1"
+        # But the original raw dict should NOT be mutated
+        assert "_target_id" not in target_file_data
+
+    def test_target_change_no_reverse_match_returns_none(self, mock_drive, mock_state):
+        """A change for an unknown file outside our folder returns None."""
+        from sync_engine import classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = None
+        raw = {"file": _make_file_data()}
+
+        result = classify_change("unknown_file", raw, mock_drive, mock_state)
+        assert result is None
+
+
+class TestDownloadShortcut:
+    """Tests for downloading shortcut targets via _target_id."""
+
+    @patch("sync_engine.extract_text")
+    def test_download_uses_target_id(self, mock_extract):
+        """_download_and_extract should use _target_id for the download call."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.return_value = False
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"target content"
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(name="link.docx", md5="abc")
+        file_data["_target_id"] = "target1"
+
+        change = Change(
+            file_id="shortcut1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="Reports/link.docx",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # Should download from target, not shortcut
+        mock_drive.download_file.assert_called_once_with("target1")
+
+    @patch("sync_engine.extract_text")
+    def test_export_uses_target_id(self, mock_extract):
+        """Google-native shortcut targets should export using _target_id."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = lambda inp, out, mime_type=None: False
+
+        mock_drive = MagicMock()
+        mock_drive.export_file.return_value = b"exported bytes"
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(
+            name="My Doc",
+            mime_type="application/vnd.google-apps.document",
+            md5=None,
+        )
+        file_data["_target_id"] = "target1"
+
+        change = Change(
+            file_id="shortcut1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="My Doc",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # Should export from target, not shortcut
+        mock_drive.export_file.assert_called_once_with(
+            "target1",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    @patch("sync_engine.extract_text")
+    def test_download_without_target_id_uses_file_id(self, mock_extract):
+        """Regular (non-shortcut) files should use change.file_id for download."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.return_value = False
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"content"
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(name="regular.docx", md5="abc")
+        # No _target_id
+
+        change = Change(
+            file_id="regular_file1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="regular.docx",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_drive.download_file.assert_called_once_with("regular_file1")
+
+
+class TestUpdateFileStateShortcut:
+    """Tests for target_id persistence in update_file_state."""
+
+    def test_shortcut_stores_target_id(self, mock_state):
+        """update_file_state should persist target_id when _target_id is present."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        file_data = _make_file_data(name="link.docx", md5="abc")
+        file_data["_target_id"] = "target1"
+
+        change = Change(
+            file_id="shortcut1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="Reports/link.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["target_id"] == "target1"
+
+    def test_regular_file_omits_target_id(self, mock_state):
+        """update_file_state should NOT include target_id for regular files."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        file_data = _make_file_data(name="regular.docx", md5="abc")
+        # No _target_id
+
+        change = Change(
+            file_id="regular1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="regular.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert "target_id" not in stored

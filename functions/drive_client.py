@@ -17,18 +17,21 @@ logger = logging.getLogger(__name__)
 CHANGE_FIELDS = (
     "nextPageToken,newStartPageToken,"
     "changes(fileId,removed,file(id,name,parents,mimeType,md5Checksum,"
-    "trashed,modifiedTime,size,lastModifyingUser(displayName,emailAddress)))"
+    "trashed,modifiedTime,size,lastModifyingUser(displayName,emailAddress),"
+    "shortcutDetails(targetId,targetMimeType)))"
 )
 
-FILE_FIELDS = "id,name,parents,mimeType"
+FILE_FIELDS = "id,name,parents,mimeType,shortcutDetails(targetId,targetMimeType)"
 
 # Fields for full file listing (initial sync)
 LIST_FILE_FIELDS = (
     "id,name,parents,mimeType,md5Checksum,"
-    "modifiedTime,size,lastModifyingUser(displayName,emailAddress)"
+    "modifiedTime,size,lastModifyingUser(displayName,emailAddress),"
+    "shortcutDetails(targetId,targetMimeType)"
 )
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 
 
 class DriveClient:
@@ -41,6 +44,40 @@ class DriveClient:
             self.service = service
         # Cache for folder names (id → name)
         self._folder_cache: dict[str, str | None] = {}
+
+    def resolve_shortcut(self, file_data: dict) -> dict | None:
+        """Resolve a Drive shortcut to its target's live metadata.
+
+        Returns a merged dict keeping the shortcut's id/name/parents but
+        overlaying the target's mimeType, md5Checksum, modifiedTime, size,
+        and lastModifyingUser.  Adds ``_target_id`` so downstream code
+        downloads from the target.  Returns None if the target is
+        inaccessible (broken shortcut).
+        """
+        details = file_data.get("shortcutDetails", {})
+        target_id = details.get("targetId")
+        if not target_id:
+            return None
+
+        try:
+            target = (
+                self.service.files()
+                .get(fileId=target_id, fields=LIST_FILE_FIELDS, supportsAllDrives=True)
+                .execute()
+            )
+        except Exception:
+            logger.warning(f"Cannot access shortcut target {target_id} for {file_data.get('name')}")
+            return None
+
+        # Merge: keep shortcut's identity, overlay target's content metadata
+        merged = dict(file_data)
+        for key in ("mimeType", "md5Checksum", "modifiedTime", "size", "lastModifyingUser"):
+            if key in target:
+                merged[key] = target[key]
+        merged["_target_id"] = target_id
+        # Remove shortcutDetails so downstream doesn't re-process
+        merged.pop("shortcutDetails", None)
+        return merged
 
     def list_changes(self, page_token: str) -> tuple[list[dict], str]:
         """Fetch all changes since page_token.
@@ -113,6 +150,19 @@ class DriveClient:
                 for f in response.get("files", []):
                     if f.get("mimeType") == FOLDER_MIME:
                         queue.append(f["id"])
+                    elif f.get("mimeType") == SHORTCUT_MIME:
+                        target_mime = f.get("shortcutDetails", {}).get("targetMimeType")
+                        if target_mime == FOLDER_MIME:
+                            # Shortcut to folder — recurse into the target
+                            target_id = f["shortcutDetails"]["targetId"]
+                            queue.append(target_id)
+                        else:
+                            # Shortcut to file — resolve and add
+                            resolved = self.resolve_shortcut(f)
+                            if resolved:
+                                result.append(resolved)
+                            else:
+                                logger.warning(f"Broken shortcut: {f.get('name')} — skipping")
                     else:
                         result.append(f)
 

@@ -137,6 +137,20 @@ class StateManager:
         for doc in docs:
             doc.reference.delete()
 
+    def get_file_by_target(self, target_id: str) -> tuple[str, dict] | None:
+        """Find a tracked shortcut by its target_id."""
+        docs = (
+            self.db.collection(self.collection)
+            .document("files")
+            .collection("tracked")
+            .where("target_id", "==", target_id)
+            .limit(1)
+            .stream()
+        )
+        for doc in docs:
+            return (doc.id, doc.to_dict())
+        return None
+
     def get_files_in_folder(self, folder_path: str) -> dict[str, dict]:
         """Return all tracked files whose path starts with folder_path."""
         all_files = self.get_all_files()
