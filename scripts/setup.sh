@@ -1368,8 +1368,11 @@ printf "  ${BOLD}Step 3: Starting Drive sync${NC}\n"
 hint "Telling Google Drive to send change notifications to your function"
 hint "and running an initial sync of existing files."
 
+WATCH_DONE=false
+
 if $DRY_RUN; then
   ok "Would initialize watch channel [dry-run]"
+  WATCH_DONE=true
 else
   IDENTITY_TOKEN=$(gcloud auth print-identity-token --audiences="$SETUP_URL" 2>/dev/null || true)
   # Fallback without --audiences if token doesn't look like a JWT
@@ -1382,16 +1385,64 @@ else
     echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
     echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
   else
-    printf "  ⏳ Initializing watch channel and syncing existing files..."
-    WATCH_RESULT=$(curl -s -X POST "${SETUP_URL}?initial_sync=true" \
-      -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
-    printf "\r\033[2K"
+    # Retry loop — domain verification can take time to propagate, and the
+    # Cloud Function may cold-start slowly on the first call.
+    WATCH_MAX=3
+    WATCH_HTTP="000"
+    WATCH_RESULT=""
+    WATCH_STATUS=""
+    WATCH_ATTEMPT=0
 
-    WATCH_STATUS=$(json_field "$WATCH_RESULT" "status")
+    while [ "$WATCH_ATTEMPT" -lt "$WATCH_MAX" ]; do
+      WATCH_ATTEMPT=$((WATCH_ATTEMPT + 1))
+      WATCH_LOG=$(mktemp)
+      HTTP_LOG=$(mktemp)
+      curl -s --max-time 120 -o "$WATCH_LOG" -w "%{http_code}" \
+        -X POST "${SETUP_URL}?initial_sync=true" \
+        -H "Authorization: bearer $IDENTITY_TOKEN" \
+        >"$HTTP_LOG" 2>/dev/null &
+      CURL_PID=$!; CURL_S=0
+      while kill -0 "$CURL_PID" 2>/dev/null; do
+        if [ "$WATCH_ATTEMPT" -eq 1 ]; then
+          printf "\r  ⏳ Initializing watch channel and syncing existing files (%ds) " "$CURL_S"
+        else
+          printf "\r  ⏳ Retrying watch setup — attempt %d/%d (%ds) " "$WATCH_ATTEMPT" "$WATCH_MAX" "$CURL_S"
+        fi
+        sleep 1; CURL_S=$((CURL_S + 1))
+      done
+      wait "$CURL_PID" || true
+      WATCH_HTTP=$(cat "$HTTP_LOG" 2>/dev/null)
+      WATCH_HTTP="${WATCH_HTTP:-000}"
+      WATCH_RESULT=$(cat "$WATCH_LOG" 2>/dev/null || echo "")
+      rm -f "$WATCH_LOG" "$HTTP_LOG"
+      printf "\r\033[2K"
 
+      WATCH_STATUS=$(json_field "$WATCH_RESULT" "status")
+
+      # Success — stop retrying
+      if [ "$WATCH_STATUS" = "ok" ] || [ "$WATCH_STATUS" = "initialized" ]; then
+        break
+      fi
+
+      # 403 = auth/permission issue — retrying won't help
+      if [ "$WATCH_HTTP" = "403" ]; then
+        break
+      fi
+
+      # Retryable failure — wait and try again
+      if [ "$WATCH_ATTEMPT" -lt "$WATCH_MAX" ]; then
+        DELAY=$((WATCH_ATTEMPT * 10))
+        info "Attempt $WATCH_ATTEMPT didn't succeed (HTTP $WATCH_HTTP) — retrying in ${DELAY}s..."
+        hint "Domain verification can take a moment to propagate."
+        sleep "$DELAY"
+      fi
+    done
+
+    # ── Handle result ──
     if [ "$WATCH_STATUS" = "ok" ] || [ "$WATCH_STATUS" = "initialized" ]; then
       SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
       ok "Watch channel initialized — Drive sync is active!"
+      WATCH_DONE=true
       if [ -z "$SYNC_COUNT" ]; then
         warn "Sync could not run — lock may be held or initial_sync was skipped."
         hint "Wait a few minutes and re-run: make setup"
@@ -1408,43 +1459,84 @@ else
           # Files exist in Drive but Firestore thinks they're already tracked.
           # Likely stale state from a previous failed run — retry with force.
           hint "Drive has $FILES_LISTED files but state says already synced — retrying with reset..."
-          printf "  ⏳ Re-syncing with fresh state..."
-          WATCH_RESULT=$(curl -s -X POST "${SETUP_URL}?initial_sync=true&force=true" \
-            -H "Authorization: bearer $IDENTITY_TOKEN" 2>/dev/null || echo "")
+          WATCH_LOG=$(mktemp)
+          HTTP_LOG=$(mktemp)
+          curl -s --max-time 120 -o "$WATCH_LOG" -w "%{http_code}" \
+            -X POST "${SETUP_URL}?initial_sync=true&force=true" \
+            -H "Authorization: bearer $IDENTITY_TOKEN" \
+            >"$HTTP_LOG" 2>/dev/null &
+          CURL_PID=$!; CURL_S=0
+          while kill -0 "$CURL_PID" 2>/dev/null; do
+            printf "\r  ⏳ Re-syncing with fresh state (%ds) " "$CURL_S"
+            sleep 1; CURL_S=$((CURL_S + 1))
+          done
+          wait "$CURL_PID" || true
+          FORCE_HTTP=$(cat "$HTTP_LOG" 2>/dev/null)
+          FORCE_HTTP="${FORCE_HTTP:-000}"
+          WATCH_RESULT=$(cat "$WATCH_LOG" 2>/dev/null || echo "")
+          rm -f "$WATCH_LOG" "$HTTP_LOG"
           printf "\r\033[2K"
-          SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
-          if [ -z "$SYNC_COUNT" ]; then
-            warn "Sync lock was held during retry. Wait a few minutes and re-run: make setup"
-          elif [ "$SYNC_COUNT" != "0" ]; then
-            ok "Initial sync complete: $SYNC_COUNT files committed to git"
+          if [ "$FORCE_HTTP" != "200" ]; then
+            warn "Force-resync failed (HTTP $FORCE_HTTP). Check function logs:"
+            echo -e "    gcloud functions logs read drive-sync-setup-watch --region=$REGION --limit=20"
           else
-            warn "Sync returned 0 files after reset. Check Cloud Function logs."
+            SYNC_COUNT=$(json_field "$WATCH_RESULT" "initial_sync_count")
+            if [ -z "$SYNC_COUNT" ]; then
+              warn "Sync lock was held during retry. Wait a few minutes and re-run: make setup"
+            elif [ "$SYNC_COUNT" != "0" ]; then
+              ok "Initial sync complete: $SYNC_COUNT files committed to git"
+            else
+              warn "Sync returned 0 files after reset. Check Cloud Function logs."
+            fi
           fi
         else
           # FILES_LISTED is "?" — debug data missing (old function code?) or parse error
           hint "No new files to sync (folder empty or already up-to-date)"
-          hint "Debug: $(echo "$WATCH_RESULT" | head -c 500)"
+          hint "Debug: ${WATCH_RESULT:0:200}"
         fi
       fi
+
+    elif [ "$WATCH_HTTP" = "403" ]; then
+      CURRENT_USER=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null || echo "YOUR_EMAIL")
+      warn "Function rejected the request (HTTP 403)."
+      hint "Your account ($CURRENT_USER) doesn't have permission to invoke the function."
+      hint "Grant yourself access, then re-run:"
+      echo ""
+      echo -e "    gcloud run services add-iam-policy-binding drive-sync-setup-watch \\"
+      echo -e "      --region=$REGION --project=$GCP_PROJECT \\"
+      echo -e "      --member=\"user:$CURRENT_USER\" --role=roles/run.invoker"
+      echo ""
+      hint "Then: make setup"
+
+    elif [ "$WATCH_HTTP" = "500" ]; then
+      warn "Function returned an internal error after $WATCH_MAX attempts."
+      hint "This usually means domain verification hasn't propagated yet."
+      hint "Wait a minute and re-run: make setup"
+      echo ""
+      hint "If it keeps failing, check the logs:"
+      echo -e "    gcloud functions logs read drive-sync-setup-watch --region=$REGION --limit=20"
+
     else
       ERR=$(json_error "$WATCH_RESULT")
       if [ -n "$ERR" ]; then
-        warn "Watch setup returned: $ERR"
+        warn "Watch setup failed: $ERR"
+      elif [ "$WATCH_HTTP" != "000" ]; then
+        warn "Watch setup failed (HTTP $WATCH_HTTP)."
       else
-        warn "Watch setup may have failed."
+        warn "Watch setup failed — couldn't reach the function."
+        hint "The function may still be deploying. Wait a minute and re-run: make setup"
       fi
-      hint "This often means domain verification isn't complete."
-      hint "Complete step 1, then run:"
-      echo ""
-      echo -e "    curl -X POST \"${SETUP_URL}?initial_sync=true\" \\\\"
-      echo -e "      -H \"Authorization: bearer \$(gcloud auth print-identity-token)\""
+      if [ "$WATCH_HTTP" != "000" ]; then
+        hint "Check the logs for details:"
+        echo -e "    gcloud functions logs read drive-sync-setup-watch --region=$REGION --limit=20"
+      fi
     fi
   fi
 fi
 
 # ── Done ────────────────────────────────────────────────────────────
 echo ""
-if $VERIFY_DONE && $SHARE_DONE; then
+if $VERIFY_DONE && $SHARE_DONE && $WATCH_DONE; then
   echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
   echo -e "  ${DIM}Any file added or edited in your Drive folder will automatically${NC}"
   echo -e "  ${DIM}appear as a commit in your git repo.${NC}"
@@ -1460,6 +1552,7 @@ if $AUTO; then
   STEPS_REMAINING=0
   $VERIFY_DONE || STEPS_REMAINING=$((STEPS_REMAINING + 1))
   $SHARE_DONE  || STEPS_REMAINING=$((STEPS_REMAINING + 1))
+  $WATCH_DONE  || STEPS_REMAINING=$((STEPS_REMAINING + 1))
 
   echo ""
   echo "--- AGENT SUMMARY ---"

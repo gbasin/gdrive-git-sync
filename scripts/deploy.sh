@@ -71,6 +71,10 @@ cd "$ROOT_DIR"
 # ── Check GCP auth ───────────────────────────────────────────────────
 if ! gcloud auth application-default print-access-token &>/dev/null; then
   echo "⚠  GCP credentials expired or missing."
+  if [ -n "${CI:-}" ] || [ -n "${NONINTERACTIVE:-}" ]; then
+    echo "   Run: gcloud auth application-default login"
+    exit 1
+  fi
   echo "   Re-authenticating…"
   gcloud auth application-default login
 fi
