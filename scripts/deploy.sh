@@ -68,6 +68,13 @@ cd functions
 zip -r ../functions_source.zip . -x '__pycache__/*' '*.pyc'
 cd "$ROOT_DIR"
 
+# ── Check GCP auth ───────────────────────────────────────────────────
+if ! gcloud auth application-default print-access-token &>/dev/null; then
+  echo "⚠  GCP credentials expired or missing."
+  echo "   Re-authenticating…"
+  gcloud auth application-default login
+fi
+
 # ── Terraform ────────────────────────────────────────────────────────
 echo "=== Running Terraform ==="
 cd infra
