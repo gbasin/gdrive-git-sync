@@ -13,6 +13,7 @@ lock:
 
 lint: lint-shell
 	uv run ruff check functions/ tests/
+	uv run ruff format --check functions/ tests/
 
 lint-shell:
 	shellcheck scripts/*.sh

@@ -46,10 +46,12 @@ class TestSyncHandlerChannelValidation:
         """Channel-less request with valid trigger secret should sync."""
         from main import sync_handler
 
-        request = _make_request(headers={
-            "X-Goog-Resource-State": "update",
-            "X-Sync-Trigger-Secret": "test-trigger-secret",
-        })
+        request = _make_request(
+            headers={
+                "X-Goog-Resource-State": "update",
+                "X-Sync-Trigger-Secret": "test-trigger-secret",
+            }
+        )
 
         with (
             patch("main.StateManager") as MockState,
@@ -72,9 +74,11 @@ class TestSyncHandlerChannelValidation:
         """Channel-less request without trigger secret should be rejected."""
         from main import sync_handler
 
-        request = _make_request(headers={
-            "X-Goog-Resource-State": "update",
-        })
+        request = _make_request(
+            headers={
+                "X-Goog-Resource-State": "update",
+            }
+        )
 
         with (
             patch("main.StateManager") as MockState,
@@ -97,10 +101,12 @@ class TestSyncHandlerChannelValidation:
         """Request with a channel ID that matches the stored one should sync."""
         from main import sync_handler
 
-        request = _make_request(headers={
-            "X-Goog-Channel-ID": "correct-channel-id",
-            "X-Goog-Resource-State": "update",
-        })
+        request = _make_request(
+            headers={
+                "X-Goog-Channel-ID": "correct-channel-id",
+                "X-Goog-Resource-State": "update",
+            }
+        )
 
         with (
             patch("main.StateManager") as MockState,
@@ -123,10 +129,12 @@ class TestSyncHandlerChannelValidation:
         """Request with a channel ID that does NOT match should return 200 immediately."""
         from main import sync_handler
 
-        request = _make_request(headers={
-            "X-Goog-Channel-ID": "wrong-channel-id",
-            "X-Goog-Resource-State": "update",
-        })
+        request = _make_request(
+            headers={
+                "X-Goog-Channel-ID": "wrong-channel-id",
+                "X-Goog-Resource-State": "update",
+            }
+        )
 
         with (
             patch("main.StateManager") as MockState,
@@ -159,10 +167,12 @@ class TestSyncHandlerValidationPing:
         """resource_state == 'sync' is the initial validation ping -- just ACK it."""
         from main import sync_handler
 
-        request = _make_request(headers={
-            "X-Goog-Channel-ID": "some-channel",
-            "X-Goog-Resource-State": "sync",
-        })
+        request = _make_request(
+            headers={
+                "X-Goog-Channel-ID": "some-channel",
+                "X-Goog-Resource-State": "sync",
+            }
+        )
 
         with (
             patch("main.StateManager") as MockState,

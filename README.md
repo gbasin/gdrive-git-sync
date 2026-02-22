@@ -216,7 +216,7 @@ make ci
 | Command | What it does |
 |---------|-------------|
 | `make install` | Install all deps via uv (creates `.venv` automatically) |
-| `make lint` | Run ruff linter |
+| `make lint` | Run shellcheck + ruff lint + ruff format check |
 | `make format` | Auto-format code (ruff + terraform fmt) |
 | `make typecheck` | Run mypy type checker |
 | `make test` | Run pytest with coverage |
