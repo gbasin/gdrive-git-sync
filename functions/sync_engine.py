@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 from config import get_config
-from drive_client import SHORTCUT_MIME, DriveClient
+from drive_client import FOLDER_MIME, SHORTCUT_MIME, DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
 from text_extractor import GOOGLE_NATIVE_EXPORTS as NATIVE_EXPORTS
@@ -288,6 +288,10 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
             )
         return None  # Unknown file deleted, nothing to do
 
+    # Skip folders — they appear in the changes feed but can't be downloaded
+    if file_data.get("mimeType") == FOLDER_MIME:
+        return None
+
     # Resolve shortcuts — replace file_data with target metadata
     if file_data.get("mimeType") == SHORTCUT_MIME:
         resolved = drive.resolve_shortcut(file_data)
@@ -500,10 +504,9 @@ def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, doc
 def _guess_native_mime(file_id: str, drive: DriveClient) -> str | None:
     """Fetch the file's mimeType from Drive to determine if it's Google-native."""
     try:
-        meta = drive.service.files().get(
-            fileId=file_id, fields="mimeType", supportsAllDrives=True
-        ).execute()
-        return meta.get("mimeType")
+        meta = drive.service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+        result: str | None = meta.get("mimeType")
+        return result
     except Exception:
         return None
 
