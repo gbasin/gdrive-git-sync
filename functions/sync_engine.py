@@ -497,6 +497,17 @@ def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, doc
     logger.info(f"{change.change_type.upper()} {change.new_path}")
 
 
+def _guess_native_mime(file_id: str, drive: DriveClient) -> str | None:
+    """Fetch the file's mimeType from Drive to determine if it's Google-native."""
+    try:
+        meta = drive.service.files().get(
+            fileId=file_id, fields="mimeType", supportsAllDrives=True
+        ).execute()
+        return meta.get("mimeType")
+    except Exception:
+        return None
+
+
 def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, docs_subdir: str):
     """Download a file from Drive, write original to repo, extract text alongside it."""
     file_data = change.file_data
@@ -505,6 +516,8 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
     mime_type = file_data.get("mimeType", "")
     name = file_data.get("name", "unknown")
     download_id = file_data.get("_target_id", change.file_id)
+
+    logger.info(f"Downloading {name} (id={download_id}, mimeType={mime_type})")
 
     # Determine if Google-native and needs export
     if mime_type in NATIVE_EXPORTS:
@@ -515,8 +528,35 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
         dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
         original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
     else:
-        content = drive.download_file(download_id)
-        original_path = change.new_path
+        try:
+            content = drive.download_file(download_id)
+        except Exception as exc:
+            # If Drive says the file isn't downloadable, it's a Google-native
+            # file whose mimeType wasn't in the changes feed metadata (e.g.
+            # Google Forms, or a stale mimeType from a shortcut).  Re-fetch
+            # the actual mimeType and retry as an export.
+            if "fileNotDownloadable" in str(exc):
+                actual_mime = _guess_native_mime(download_id, drive)
+                logger.warning(
+                    f"download_file failed for {name}: mimeType was '{mime_type}', "
+                    f"actual mimeType is '{actual_mime}' — retrying as export"
+                )
+                if actual_mime and actual_mime in NATIVE_EXPORTS:
+                    mime_type = actual_mime
+                    fmt, ext, export_mime = NATIVE_EXPORTS[mime_type]
+                    content = drive.export_file(download_id, export_mime)
+                    exported_name = name + ext
+                    dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
+                    original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
+                    # Update file_data so downstream text extraction uses the
+                    # correct mimeType and state is recorded accurately.
+                    file_data["mimeType"] = actual_mime
+                else:
+                    raise
+            else:
+                raise
+        else:
+            original_path = change.new_path
 
     # Write original to repo
     repo.write_file(os.path.join(docs_subdir, original_path), content)
