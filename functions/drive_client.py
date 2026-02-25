@@ -247,6 +247,15 @@ class DriveClient:
             self._folder_cache[folder_id] = None
             return None
 
+    def get_file_mime(self, file_id: str) -> str | None:
+        """Fetch the authoritative mimeType for a file."""
+        try:
+            result = self.service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+            mime: str | None = result.get("mimeType")
+            return mime
+        except Exception:
+            return None
+
     def matches_exclude_pattern(self, relative_path: str) -> bool:
         """Check if a relative path matches any EXCLUDE_PATHS pattern."""
         for pattern in self.cfg.exclude_paths:

@@ -5,6 +5,8 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 
+from googleapiclient.errors import HttpError
+
 from config import get_config
 from drive_client import FOLDER_MIME, SHORTCUT_MIME, DriveClient
 from git_ops import GitRepo
@@ -290,6 +292,7 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
 
     # Skip folders — they appear in the changes feed but can't be downloaded
     if file_data.get("mimeType") == FOLDER_MIME:
+        logger.debug(f"Skipping folder {file_data.get('name', file_id)}")
         return None
 
     # Resolve shortcuts — replace file_data with target metadata
@@ -501,14 +504,13 @@ def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, doc
     logger.info(f"{change.change_type.upper()} {change.new_path}")
 
 
-def _guess_native_mime(file_id: str, drive: DriveClient) -> str | None:
-    """Fetch the file's mimeType from Drive to determine if it's Google-native."""
-    try:
-        meta = drive.service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
-        result: str | None = meta.get("mimeType")
-        return result
-    except Exception:
-        return None
+def _is_not_downloadable(exc: Exception) -> bool:
+    """Check if an exception is a 403 fileNotDownloadable from the Drive API."""
+    return (
+        isinstance(exc, HttpError)
+        and exc.status_code == 403
+        and any(d.get("reason") == "fileNotDownloadable" for d in (exc.error_details or []))
+    )
 
 
 def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, docs_subdir: str):
@@ -535,29 +537,26 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
             content = drive.download_file(download_id)
         except Exception as exc:
             # If Drive says the file isn't downloadable, it's a Google-native
-            # file whose mimeType wasn't in the changes feed metadata (e.g.
-            # Google Forms, or a stale mimeType from a shortcut).  Re-fetch
-            # the actual mimeType and retry as an export.
-            if "fileNotDownloadable" in str(exc):
-                actual_mime = _guess_native_mime(download_id, drive)
-                logger.warning(
-                    f"download_file failed for {name}: mimeType was '{mime_type}', "
-                    f"actual mimeType is '{actual_mime}' — retrying as export"
-                )
-                if actual_mime and actual_mime in NATIVE_EXPORTS:
-                    mime_type = actual_mime
-                    fmt, ext, export_mime = NATIVE_EXPORTS[mime_type]
-                    content = drive.export_file(download_id, export_mime)
-                    exported_name = name + ext
-                    dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
-                    original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
-                    # Update file_data so downstream text extraction uses the
-                    # correct mimeType and state is recorded accurately.
-                    file_data["mimeType"] = actual_mime
-                else:
-                    raise
-            else:
+            # file whose mimeType wasn't in the changes feed metadata.
+            # Re-fetch the actual mimeType and retry as an export.
+            if not _is_not_downloadable(exc):
                 raise
+            actual_mime = drive.get_file_mime(download_id)
+            logger.warning(
+                f"download_file failed for {name}: mimeType was '{mime_type}', "
+                f"actual mimeType is '{actual_mime}' — retrying as export"
+            )
+            if not actual_mime or actual_mime not in NATIVE_EXPORTS:
+                raise
+            mime_type = actual_mime
+            fmt, ext, export_mime = NATIVE_EXPORTS[mime_type]
+            content = drive.export_file(download_id, export_mime)
+            exported_name = name + ext
+            dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
+            original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
+            # Update file_data so downstream text extraction and state
+            # recording use the correct mimeType.
+            file_data["mimeType"] = actual_mime
         else:
             original_path = change.new_path
 
