@@ -43,11 +43,16 @@ class GitRepo:
         raise ValueError(f"Unsupported git URL scheme: {url}")
 
     @staticmethod
-    def _redact_args(args: list[str]) -> list[str]:
-        """Replace oauth2:TOKEN@ in args with oauth2:***@ for safe logging."""
+    def _redact(text: str) -> str:
+        """Replace oauth2:TOKEN@ with oauth2:***@ in any string."""
         import re
 
-        return [re.sub(r"oauth2:[^@]+@", "oauth2:***@", a) for a in args]
+        return re.sub(r"oauth2:[^@]+@", "oauth2:***@", text)
+
+    @staticmethod
+    def _redact_args(args: list[str]) -> list[str]:
+        """Replace oauth2:TOKEN@ in args with oauth2:***@ for safe logging."""
+        return [GitRepo._redact(a) for a in args]
 
     def _run(
         self,
@@ -74,9 +79,11 @@ class GitRepo:
         )
         if result.returncode != 0:
             safe_args = self._redact_args(args)
+            safe_stderr = self._redact(result.stderr)
+            safe_stdout = self._redact(result.stdout)
             if log_errors:
-                logger.error(f"Git command failed: {' '.join(safe_args)}\nstderr: {result.stderr}")
-            raise subprocess.CalledProcessError(result.returncode, safe_args, result.stdout, result.stderr)
+                logger.error(f"Git command failed: {' '.join(safe_args)}\nstderr: {safe_stderr}")
+            raise subprocess.CalledProcessError(result.returncode, safe_args, safe_stdout, safe_stderr)
         return result.stdout
 
     def _configure_identity(self):
@@ -178,8 +185,10 @@ class GitRepo:
         try:
             self._run(["git", "diff", "--cached", "--quiet"], log_errors=False)
             return False
-        except subprocess.CalledProcessError:
-            return True  # Return code 1 means there are differences
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                return True  # Return code 1 means there are differences
+            raise  # Real errors should propagate
 
     def commit(self, message: str, author_name: str, author_email: str):
         """Create a commit with the given author."""
