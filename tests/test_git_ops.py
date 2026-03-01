@@ -139,7 +139,7 @@ class TestWriteFile:
 
         # git add should have been called
         args = mock_run.call_args[0][0]
-        assert args == ["git", "add", "docs/test.txt"]
+        assert args == ["git", "add", "--", "docs/test.txt"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +163,7 @@ class TestRenameFile:
         git_repo.rename_file("old/file.txt", "new/file.txt")
 
         args = mock_run.call_args[0][0]
-        assert args == ["git", "mv", "old/file.txt", "new/file.txt"]
+        assert args == ["git", "mv", "--", "old/file.txt", "new/file.txt"]
 
     @patch("git_ops.subprocess.run")
     def test_rename_skips_missing_source(self, mock_run, git_repo):
@@ -197,7 +197,7 @@ class TestDeleteFile:
         git_repo.delete_file("doomed.txt")
 
         args = mock_run.call_args[0][0]
-        assert args == ["git", "rm", "-f", "doomed.txt"]
+        assert args == ["git", "rm", "-f", "--", "doomed.txt"]
 
     @patch("git_ops.subprocess.run")
     def test_delete_noop_when_file_missing(self, mock_run, git_repo):

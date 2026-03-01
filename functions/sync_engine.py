@@ -163,7 +163,10 @@ def run_initial_sync(
     # Clone (handles empty repos)
     repo.clone_or_init()
 
-    processed, _had_failures = process_changes(changes, drive, repo, state, cfg)
+    processed, had_failures = process_changes(changes, drive, repo, state, cfg)
+    if had_failures:
+        debug["had_failures"] = True
+        debug["failed_count"] = len(changes) - len(processed)
 
     if processed:
         author_groups = group_by_author(processed, cfg)
@@ -257,8 +260,8 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
 
     logger.info(f"Processing {len(changes)} changes")
 
-    # Clone repo
-    repo.clone()
+    # Clone repo (clone_or_init handles empty repos gracefully)
+    repo.clone_or_init()
 
     # Process changes: download files, extract text
     # Files are written to repo working tree and staged via git add
@@ -505,19 +508,26 @@ def _cascade_folder_delete(
     else:
         # Drive API couldn't list children (trashed folder, permission issue).
         # Fall back to Firestore state: find tracked files whose path starts
-        # with this folder's name.
+        # with this folder's name.  We use just the folder name (not
+        # get_file_path) because after move-out the folder's parents point
+        # outside the monitored tree, producing a path that won't match
+        # any Firestore entries (which store the old in-tree path).
         folder_name = file_data.get("name") if file_data else None
-        if folder_name and file_data is not None:
-            folder_path = drive.get_file_path(file_data) if file_data.get("parents") else folder_name
-            tracked = state.get_files_in_folder(folder_path)
-            for fid, fdata in tracked.items():
-                changes.append(
-                    Change(
-                        file_id=fid,
-                        change_type=ChangeType.DELETE,
-                        old_path=fdata.get("path"),
+        if folder_name:
+            # Search for "<folder_name>/" prefix in all tracked paths.
+            # get_files_in_folder does a prefix match on the path field.
+            all_tracked = state.get_all_files()
+            for fid, fdata in all_tracked.items():
+                p = fdata.get("path", "")
+                # Match paths like "FolderName/..." or ".../FolderName/..."
+                if p.startswith(folder_name + "/") or ("/" + folder_name + "/") in p:
+                    changes.append(
+                        Change(
+                            file_id=fid,
+                            change_type=ChangeType.DELETE,
+                            old_path=p,
+                        )
                     )
-                )
             if changes:
                 logger.info(f"Folder {folder_name} — used state fallback, {len(changes)} tracked files")
         if not changes:

@@ -1501,7 +1501,7 @@ class TestRunSync:
         mock_drive.get_start_page_token.assert_called_once()
         mock_state.set_page_token.assert_called_once_with("initial_token_42")
         # Should NOT clone, push, or list changes
-        mock_repo.clone.assert_not_called()
+        mock_repo.clone_or_init.assert_not_called()
         mock_drive.list_changes.assert_not_called()
 
     # -- 2. No changes returns zero --------------------------------------------
@@ -1518,7 +1518,7 @@ class TestRunSync:
 
         assert result == 0
         mock_state.set_page_token.assert_called_once_with("token_2")
-        mock_repo.clone.assert_not_called()
+        mock_repo.clone_or_init.assert_not_called()
 
     # -- 3. All changes skipped returns zero -----------------------------------
 
@@ -1544,7 +1544,7 @@ class TestRunSync:
 
         assert result == 0
         mock_state.set_page_token.assert_called_once_with("token_2")
-        mock_repo.clone.assert_not_called()
+        mock_repo.clone_or_init.assert_not_called()
 
     # -- 4. Single file add — full pipeline ------------------------------------
 
@@ -1572,7 +1572,7 @@ class TestRunSync:
 
         assert result == 1
         # Verify the full sequence
-        mock_repo.clone.assert_called_once()
+        mock_repo.clone_or_init.assert_called_once()
         mock_drive.download_file.assert_called_once_with("f1")
         mock_extract.assert_called_once()
         mock_repo.commit.assert_called_once()
@@ -2159,24 +2159,44 @@ class TestFolderChangeExpansion:
         assert all(c.change_type == "delete" for c in result)
 
     def test_folder_cascade_falls_back_to_state(self):
-        """When Drive API returns no children, fall back to state prefix search."""
+        """When Drive API returns no children, fall back to state name-based search."""
         from sync_engine import _cascade_folder_delete
 
         mock_drive = MagicMock()
         mock_drive.list_folder_files.return_value = []  # API failed
-        mock_drive.get_file_path.return_value = "Projects/OldFolder"
 
         mock_state = MagicMock()
-        mock_state.get_files_in_folder.return_value = {
+        mock_state.get_all_files.return_value = {
             "c1": {"path": "Projects/OldFolder/a.docx"},
             "c2": {"path": "Projects/OldFolder/b.pdf"},
+            "c3": {"path": "Projects/OtherFolder/c.txt"},  # should NOT match
         }
 
         file_data = {"name": "OldFolder", "parents": ["projects_folder"]}
         result = _cascade_folder_delete("folder1", file_data, mock_drive, mock_state)
         assert len(result) == 2
         assert all(c.change_type == "delete" for c in result)
-        mock_state.get_files_in_folder.assert_called_once()
+        paths = {c.old_path for c in result}
+        assert "Projects/OldFolder/a.docx" in paths
+        assert "Projects/OldFolder/b.pdf" in paths
+
+    def test_folder_cascade_fallback_matches_top_level_folder(self):
+        """Fallback matches folder at the root of the path tree."""
+        from sync_engine import _cascade_folder_delete
+
+        mock_drive = MagicMock()
+        mock_drive.list_folder_files.return_value = []
+
+        mock_state = MagicMock()
+        mock_state.get_all_files.return_value = {
+            "c1": {"path": "MyFolder/doc.docx"},
+            "c2": {"path": "Other/file.txt"},
+        }
+
+        file_data = {"name": "MyFolder", "parents": ["external"]}
+        result = _cascade_folder_delete("folder1", file_data, mock_drive, mock_state)
+        assert len(result) == 1
+        assert result[0].old_path == "MyFolder/doc.docx"
 
     def test_folder_in_classify_change_returns_list(self, mock_drive, mock_state):
         """classify_change with folder mimeType returns a list of Changes."""

@@ -126,7 +126,7 @@ class GitRepo:
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "wb") as f:
             f.write(content)
-        self._run(["git", "add", rel_path])
+        self._run(["git", "add", "--", rel_path])
 
     def write_text_file(self, rel_path: str, content: str):
         """Write a text file to the repo working tree."""
@@ -138,7 +138,7 @@ class GitRepo:
         new_full = os.path.join(self.repo_path, new_path)
         os.makedirs(os.path.dirname(new_full), exist_ok=True)
         if os.path.exists(old_full):
-            self._run(["git", "mv", old_path, new_path])
+            self._run(["git", "mv", "--", old_path, new_path])
             return True
         logger.warning(f"rename_file: source not found: {old_path}")
         return False
@@ -147,7 +147,7 @@ class GitRepo:
         """Delete a file using git rm."""
         full_path = os.path.join(self.repo_path, rel_path)
         if os.path.exists(full_path):
-            self._run(["git", "rm", "-f", rel_path])
+            self._run(["git", "rm", "-f", "--", rel_path])
 
     def stage_file(self, rel_path: str):
         """Stage a specific file (git add).

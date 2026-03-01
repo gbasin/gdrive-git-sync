@@ -149,7 +149,7 @@ class DriveClient:
                     )
                 except Exception:
                     if suppress_errors:
-                        logger.warning(f"Cannot list children of folder {folder_id}")
+                        logger.warning(f"Cannot list children of folder {folder_id}", exc_info=True)
                         break
                     raise
 
