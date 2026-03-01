@@ -163,7 +163,7 @@ def run_initial_sync(
     # Clone (handles empty repos)
     repo.clone_or_init()
 
-    processed = process_changes(changes, drive, repo, state, cfg)
+    processed, _had_failures = process_changes(changes, drive, repo, state, cfg)
 
     if processed:
         author_groups = group_by_author(processed, cfg)
@@ -262,7 +262,7 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
 
     # Process changes: download files, extract text
     # Files are written to repo working tree and staged via git add
-    processed = process_changes(changes, drive, repo, state, cfg)
+    processed, had_failures = process_changes(changes, drive, repo, state, cfg)
 
     if processed:
         author_groups = group_by_author(processed, cfg)
@@ -287,8 +287,12 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
         for change in processed:
             update_file_state(change, state)
 
-    # Update page token
-    state.set_page_token(new_token)
+    # Only advance page token if all changes were processed successfully.
+    # On partial failure the old token is kept so failed changes are retried.
+    if not had_failures:
+        state.set_page_token(new_token)
+    else:
+        logger.warning("Partial failures — keeping old page token for retry")
     logger.info(f"Sync complete: {len(processed)} changes committed")
     return len(processed)
 
@@ -446,7 +450,7 @@ def _handle_folder_change(
 ) -> list[Change] | None:
     """Expand a folder change into child file moves or deletes."""
     if not drive.is_in_folder(file_data):
-        return _cascade_folder_delete(folder_id, drive, state)
+        return _cascade_folder_delete(folder_id, file_data, drive, state)
 
     children = drive.list_folder_files(folder_id)
     if not children:
@@ -481,23 +485,43 @@ def _handle_folder_change(
     return changes
 
 
-def _cascade_folder_delete(folder_id: str, drive: DriveClient, state: StateManager) -> list[Change]:
+def _cascade_folder_delete(
+    folder_id: str, file_data: dict | None, drive: DriveClient, state: StateManager
+) -> list[Change]:
     """Folder moved out of monitored tree — delete all tracked children."""
     children = drive.list_folder_files(folder_id)
-    if not children:
-        logger.debug(f"Folder {folder_id} not accessible or empty")
-        return []
     changes: list[Change] = []
-    for child in children:
-        existing = state.get_file(child["id"])
-        if existing:
-            changes.append(
-                Change(
-                    file_id=child["id"],
-                    change_type=ChangeType.DELETE,
-                    old_path=existing.get("path"),
+    if children:
+        for child in children:
+            existing = state.get_file(child["id"])
+            if existing:
+                changes.append(
+                    Change(
+                        file_id=child["id"],
+                        change_type=ChangeType.DELETE,
+                        old_path=existing.get("path"),
+                    )
                 )
-            )
+    else:
+        # Drive API couldn't list children (trashed folder, permission issue).
+        # Fall back to Firestore state: find tracked files whose path starts
+        # with this folder's name.
+        folder_name = file_data.get("name") if file_data else None
+        if folder_name and file_data is not None:
+            folder_path = drive.get_file_path(file_data) if file_data.get("parents") else folder_name
+            tracked = state.get_files_in_folder(folder_path)
+            for fid, fdata in tracked.items():
+                changes.append(
+                    Change(
+                        file_id=fid,
+                        change_type=ChangeType.DELETE,
+                        old_path=fdata.get("path"),
+                    )
+                )
+            if changes:
+                logger.info(f"Folder {folder_name} — used state fallback, {len(changes)} tracked files")
+        if not changes:
+            logger.debug(f"Folder {folder_id} not accessible or empty")
     if changes:
         logger.info(f"Folder moved out — deleting {len(changes)} tracked files")
     return changes
@@ -509,9 +533,13 @@ def process_changes(
     repo: GitRepo,
     state: StateManager,
     cfg,
-) -> list[Change]:
-    """Download, extract, and stage files for each change. Returns processed changes."""
+) -> tuple[list[Change], bool]:
+    """Download, extract, and stage files for each change.
+
+    Returns (processed_changes, had_failures).
+    """
     processed = []
+    had_failures = False
     docs_subdir = cfg.docs_subdir
 
     for change in changes:
@@ -530,8 +558,9 @@ def process_changes(
 
         except Exception:
             logger.exception(f"Failed to process {change.change_type} for {change.file_id}")
+            had_failures = True
 
-    return processed
+    return processed, had_failures
 
 
 def _handle_delete(change: Change, repo: GitRepo, state: StateManager, docs_subdir: str):
@@ -575,17 +604,20 @@ def _handle_rename(change: Change, drive: DriveClient, repo: GitRepo, state: Sta
     old_original, old_extracted = _git_paths(change.old_path, old_name, mime_type)
     new_original, new_extracted = _git_paths(change.new_path, new_name, mime_type)
 
-    repo.rename_file(os.path.join(docs_subdir, old_original), os.path.join(docs_subdir, new_original))
+    moved_ok = repo.rename_file(os.path.join(docs_subdir, old_original), os.path.join(docs_subdir, new_original))
     if old_extracted and new_extracted:
         repo.rename_file(os.path.join(docs_subdir, old_extracted), os.path.join(docs_subdir, new_extracted))
 
-    # Re-download only if content changed (skip for synthetic folder-expansion MOVEs where file_data=None)
-    if change.file_data and existing:
-        md5 = change.file_data.get("md5Checksum")
-        old_md5 = existing.get("md5")
-        if (md5 and md5 != old_md5) or (
-            not md5 and change.file_data.get("modifiedTime") != existing.get("modified_time")
-        ):
+    # Re-download if content changed, OR if source file was missing (rename skipped)
+    if change.file_data:
+        need_download = not moved_ok  # source missing — re-download to new path
+        if not need_download and existing:
+            md5 = change.file_data.get("md5Checksum")
+            old_md5 = existing.get("md5")
+            need_download = (md5 and md5 != old_md5) or (
+                not md5 and change.file_data.get("modifiedTime") != existing.get("modified_time")
+            )
+        if need_download:
             _download_and_extract(change, drive, repo, docs_subdir)
 
     logger.info(f"Renamed {change.old_path} → {change.new_path}")

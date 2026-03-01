@@ -42,6 +42,13 @@ class GitRepo:
             return url.replace("https://", f"https://oauth2:{token}@", 1)
         raise ValueError(f"Unsupported git URL scheme: {url}")
 
+    @staticmethod
+    def _redact_args(args: list[str]) -> list[str]:
+        """Replace oauth2:TOKEN@ in args with oauth2:***@ for safe logging."""
+        import re
+
+        return [re.sub(r"oauth2:[^@]+@", "oauth2:***@", a) for a in args]
+
     def _run(self, args: list[str], cwd: str | None = None, env: dict | None = None) -> str:
         """Run a git command and return stdout."""
         cmd_env = os.environ.copy()
@@ -59,7 +66,8 @@ class GitRepo:
             timeout=300,
         )
         if result.returncode != 0:
-            logger.error(f"Git command failed: {' '.join(args)}\nstderr: {result.stderr}")
+            safe_args = self._redact_args(args)
+            logger.error(f"Git command failed: {' '.join(safe_args)}\nstderr: {result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
         return result.stdout
 
@@ -124,15 +132,16 @@ class GitRepo:
         """Write a text file to the repo working tree."""
         self.write_file(rel_path, content.encode("utf-8"))
 
-    def rename_file(self, old_path: str, new_path: str):
-        """Rename/move a file using git mv."""
+    def rename_file(self, old_path: str, new_path: str) -> bool:
+        """Rename/move a file using git mv. Returns True on success."""
         old_full = os.path.join(self.repo_path, old_path)
         new_full = os.path.join(self.repo_path, new_path)
         os.makedirs(os.path.dirname(new_full), exist_ok=True)
         if os.path.exists(old_full):
             self._run(["git", "mv", old_path, new_path])
-        else:
-            logger.warning(f"rename_file: source not found: {old_path}")
+            return True
+        logger.warning(f"rename_file: source not found: {old_path}")
+        return False
 
     def delete_file(self, rel_path: str):
         """Delete a file using git rm."""
@@ -141,8 +150,13 @@ class GitRepo:
             self._run(["git", "rm", "-f", rel_path])
 
     def stage_file(self, rel_path: str):
-        """Stage a specific file (git add)."""
-        self._run(["git", "add", rel_path])
+        """Stage a specific file (git add).
+
+        Works for added, modified, AND deleted files — the ``--``
+        separator ensures paths that look like flags are handled
+        correctly and ``-A`` covers deletions from the working tree.
+        """
+        self._run(["git", "add", "-A", "--", rel_path])
 
     def unstage_all(self):
         """Unstage all staged changes (git reset HEAD)."""

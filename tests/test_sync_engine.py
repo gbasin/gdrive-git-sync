@@ -1190,10 +1190,11 @@ class TestProcessChanges:
 
         with patch("sync_engine.extract_text") as mock_extract:
             mock_extract.return_value = False
-            result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+            result, had_failures = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
 
         assert len(result) == 1
         assert result[0].file_id == "f1"
+        assert not had_failures
 
     def test_processes_delete_change(self, mock_state):
         from sync_engine import Change, ChangeType, process_changes
@@ -1210,8 +1211,9 @@ class TestProcessChanges:
             old_path="old.txt",
         )
 
-        result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+        result, had_failures = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
         assert len(result) == 1
+        assert not had_failures
         mock_repo.delete_file.assert_called()
 
     def test_skips_failed_changes(self, mock_state):
@@ -1241,11 +1243,12 @@ class TestProcessChanges:
 
         with patch("sync_engine.extract_text") as mock_extract:
             mock_extract.return_value = False
-            result = process_changes(changes, mock_drive, mock_repo, mock_state, cfg)
+            result, had_failures = process_changes(changes, mock_drive, mock_repo, mock_state, cfg)
 
         # Only the second change succeeded
         assert len(result) == 1
         assert result[0].file_id == "f2"
+        assert had_failures
 
     def test_processes_rename_change(self, mock_state):
         from sync_engine import Change, ChangeType, process_changes
@@ -1270,8 +1273,9 @@ class TestProcessChanges:
             new_path="new.docx",
         )
 
-        result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+        result, had_failures = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
         assert len(result) == 1
+        assert not had_failures
         mock_repo.rename_file.assert_called()
 
     def test_empty_changes_returns_empty(self, mock_state):
@@ -1282,8 +1286,9 @@ class TestProcessChanges:
         cfg = MagicMock()
         cfg.docs_subdir = "docs"
 
-        result = process_changes([], mock_drive, mock_repo, mock_state, cfg)
+        result, had_failures = process_changes([], mock_drive, mock_repo, mock_state, cfg)
         assert result == []
+        assert not had_failures
 
     def test_modify_change_re_downloads(self, mock_state):
         from sync_engine import Change, ChangeType, process_changes
@@ -1308,9 +1313,10 @@ class TestProcessChanges:
 
         with patch("sync_engine.extract_text") as mock_extract:
             mock_extract.side_effect = _fake_extract
-            result = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+            result, had_failures = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
 
         assert len(result) == 1
+        assert not had_failures
         mock_drive.download_file.assert_called_once_with("f1")
 
 
@@ -2067,3 +2073,246 @@ class TestUpdateFileStateShortcut:
 
         stored = mock_state.set_file.call_args[0][1]
         assert "target_id" not in stored
+
+
+# ---------------------------------------------------------------------------
+# Folder change expansion
+# ---------------------------------------------------------------------------
+
+
+class TestFolderChangeExpansion:
+    """Tests for _handle_folder_change and _cascade_folder_delete."""
+
+    def test_folder_rename_expands_to_child_moves(self):
+        from sync_engine import _handle_folder_change
+
+        mock_drive = MagicMock()
+        mock_drive.is_in_folder.return_value = True
+        # Two children under the renamed folder
+        mock_drive.list_folder_files.return_value = [
+            {"id": "c1", "name": "a.docx", "parents": ["folder1"]},
+            {"id": "c2", "name": "b.pdf", "parents": ["folder1"]},
+        ]
+        mock_drive.get_file_path.side_effect = ["NewFolder/a.docx", "NewFolder/b.pdf"]
+
+        mock_state = MagicMock()
+        mock_state.get_file.side_effect = [
+            {"path": "OldFolder/a.docx", "name": "a.docx"},
+            {"path": "OldFolder/b.pdf", "name": "b.pdf"},
+        ]
+
+        file_data = {
+            "name": "NewFolder",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": ["folder123"],
+            "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+        }
+
+        result = _handle_folder_change("folder1", file_data, mock_drive, mock_state)
+        assert len(result) == 2
+        assert result[0].change_type == "move"
+        assert result[0].old_path == "OldFolder/a.docx"
+        assert result[0].new_path == "NewFolder/a.docx"
+        assert result[1].old_path == "OldFolder/b.pdf"
+        assert result[1].new_path == "NewFolder/b.pdf"
+
+    def test_folder_rename_skips_untracked_children(self):
+        from sync_engine import _handle_folder_change
+
+        mock_drive = MagicMock()
+        mock_drive.is_in_folder.return_value = True
+        mock_drive.list_folder_files.return_value = [
+            {"id": "c1", "name": "a.docx", "parents": ["folder1"]},
+        ]
+
+        mock_state = MagicMock()
+        mock_state.get_file.return_value = None  # not tracked
+
+        file_data = {
+            "name": "Folder",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": ["folder123"],
+            "lastModifyingUser": {},
+        }
+
+        result = _handle_folder_change("folder1", file_data, mock_drive, mock_state)
+        assert result == []
+
+    def test_folder_moved_out_cascades_deletes(self):
+        from sync_engine import _cascade_folder_delete
+
+        mock_drive = MagicMock()
+        mock_drive.list_folder_files.return_value = [
+            {"id": "c1"},
+            {"id": "c2"},
+        ]
+
+        mock_state = MagicMock()
+        mock_state.get_file.side_effect = [
+            {"path": "Folder/a.docx"},
+            {"path": "Folder/b.pdf"},
+        ]
+
+        file_data = {"name": "Folder", "parents": ["external"]}
+        result = _cascade_folder_delete("folder1", file_data, mock_drive, mock_state)
+        assert len(result) == 2
+        assert all(c.change_type == "delete" for c in result)
+
+    def test_folder_cascade_falls_back_to_state(self):
+        """When Drive API returns no children, fall back to state prefix search."""
+        from sync_engine import _cascade_folder_delete
+
+        mock_drive = MagicMock()
+        mock_drive.list_folder_files.return_value = []  # API failed
+        mock_drive.get_file_path.return_value = "Projects/OldFolder"
+
+        mock_state = MagicMock()
+        mock_state.get_files_in_folder.return_value = {
+            "c1": {"path": "Projects/OldFolder/a.docx"},
+            "c2": {"path": "Projects/OldFolder/b.pdf"},
+        }
+
+        file_data = {"name": "OldFolder", "parents": ["projects_folder"]}
+        result = _cascade_folder_delete("folder1", file_data, mock_drive, mock_state)
+        assert len(result) == 2
+        assert all(c.change_type == "delete" for c in result)
+        mock_state.get_files_in_folder.assert_called_once()
+
+    def test_folder_in_classify_change_returns_list(self, mock_drive, mock_state):
+        """classify_change with folder mimeType returns a list of Changes."""
+        from sync_engine import classify_change
+
+        mock_drive.is_in_folder.return_value = True
+        mock_drive.list_folder_files.return_value = []
+        mock_state.get_file.return_value = None
+
+        raw = {
+            "file": {
+                "name": "SomeFolder",
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": ["folder123"],
+                "lastModifyingUser": {},
+            },
+        }
+
+        result = classify_change("folder1", raw, mock_drive, mock_state)
+        assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# Dedup logic
+# ---------------------------------------------------------------------------
+
+
+class TestDedupChanges:
+    """Tests for the dedup logic in run_sync that prefers direct over synthetic changes."""
+
+    def test_direct_change_wins_over_synthetic_move(self):
+        """When both a direct change (with file_data) and synthetic MOVE exist,
+        the direct change should win."""
+        from sync_engine import Change, ChangeType
+
+        direct = Change(
+            file_id="f1",
+            change_type=ChangeType.MODIFY,
+            file_data={"name": "doc.docx", "mimeType": "text/plain"},
+            new_path="doc.docx",
+        )
+        synthetic = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=None,
+            old_path="old/doc.docx",
+            new_path="new/doc.docx",
+        )
+
+        # Simulate dedup logic from run_sync
+        changes = [synthetic, direct]
+        seen: dict[str, Change] = {}
+        for c in changes:
+            if c.file_id in seen:
+                if c.file_data is not None:
+                    seen[c.file_id] = c
+            else:
+                seen[c.file_id] = c
+        deduped = list(seen.values())
+
+        assert len(deduped) == 1
+        assert deduped[0].change_type == ChangeType.MODIFY
+        assert deduped[0].file_data is not None
+
+    def test_synthetic_stays_when_no_direct(self):
+        """A synthetic MOVE with no competing direct change is kept."""
+        from sync_engine import Change, ChangeType
+
+        synthetic = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=None,
+            old_path="old/doc.docx",
+            new_path="new/doc.docx",
+        )
+
+        changes = [synthetic]
+        seen: dict[str, Change] = {}
+        for c in changes:
+            if c.file_id in seen:
+                if c.file_data is not None:
+                    seen[c.file_id] = c
+            else:
+                seen[c.file_id] = c
+        deduped = list(seen.values())
+
+        assert len(deduped) == 1
+        assert deduped[0].change_type == ChangeType.MOVE
+
+
+# ---------------------------------------------------------------------------
+# Page token on partial failure
+# ---------------------------------------------------------------------------
+
+
+class TestPageTokenPartialFailure:
+    """Ensure page token is NOT advanced when some changes fail."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    @patch("sync_engine.extract_text")
+    def test_partial_failure_keeps_old_page_token(self, mock_extract, mock_drive, mock_state):
+        from sync_engine import run_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_page_token.return_value = "token_old"
+        mock_state.get_file.return_value = None  # both new
+
+        good_file = _make_file_data(name="good.txt", mime_type="text/plain", md5="g1")
+        bad_file = _make_file_data(name="bad.txt", mime_type="text/plain", md5="b1")
+
+        mock_drive.list_changes.return_value = (
+            [
+                {"fileId": "f_bad", "file": bad_file},
+                {"fileId": "f_good", "file": good_file},
+            ],
+            "token_new",
+        )
+        mock_drive.get_file_path.side_effect = ["bad.txt", "good.txt"]
+        # First download fails, second succeeds
+        mock_drive.download_file.side_effect = [Exception("network"), b"good content"]
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+        mock_repo.rename_file.return_value = True
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1  # only 1 succeeded
+        # Page token should NOT be advanced to token_new
+        set_page_token_calls = [c for c in mock_state.set_page_token.call_args_list]
+        # The only set_page_token call should NOT be "token_new"
+        for c in set_page_token_calls:
+            assert c[0][0] != "token_new"

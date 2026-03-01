@@ -303,3 +303,33 @@ class TestPush:
 
         args = mock_run.call_args[0][0]
         assert args == ["git", "push", "origin", "main"]
+
+
+# ---------------------------------------------------------------------------
+# _redact_args
+# ---------------------------------------------------------------------------
+
+
+class TestRedactArgs:
+    """Tests for token redaction in logged git commands."""
+
+    def test_redacts_oauth_token_from_url(self, git_repo):
+        args = ["git", "clone", "https://oauth2:ghp_secret123@github.com/test/repo.git"]
+        result = git_repo._redact_args(args)
+        assert result[0] == "git"
+        assert result[1] == "clone"
+        assert "ghp_secret123" not in result[2]
+        assert "oauth2:***@" in result[2]
+
+    def test_leaves_non_url_args_unchanged(self, git_repo):
+        args = ["git", "add", "file.txt"]
+        result = git_repo._redact_args(args)
+        assert result == args
+
+    def test_stage_file_uses_dash_A(self, git_repo):
+        """stage_file uses -A flag so deleted files are staged properly."""
+        with patch("git_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git_repo.stage_file("deleted.txt")
+            args = mock_run.call_args[0][0]
+            assert args == ["git", "add", "-A", "--", "deleted.txt"]

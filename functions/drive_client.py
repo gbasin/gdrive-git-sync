@@ -114,14 +114,16 @@ class DriveClient:
         response = self.service.changes().getStartPageToken(supportsAllDrives=True).execute()
         return str(response["startPageToken"])
 
-    def list_all_files(self) -> list[dict]:
-        """Recursively list all non-trashed files under the monitored folder.
+    def _list_files_recursive(self, root_folder_id: str, *, suppress_errors: bool = False) -> list[dict]:
+        """Shared recursive listing: walk folder tree, resolve shortcuts, return files.
 
-        Returns a flat list of file dicts (folders excluded) with the same
-        fields the sync pipeline needs.
+        Args:
+            root_folder_id: Folder ID to start from.
+            suppress_errors: If True, log warnings and skip folders that
+                fail to list instead of raising.
         """
         result: list[dict] = []
-        queue = [self.cfg.drive_folder_id]
+        queue = [root_folder_id]
         visited: set[str] = set()
 
         while queue:
@@ -132,66 +134,11 @@ class DriveClient:
             page_token: str | None = None
 
             while True:
-                response = (
-                    self.service.files()
-                    .list(
-                        q=f"'{folder_id}' in parents and trashed = false",
-                        fields=f"nextPageToken,files({LIST_FILE_FIELDS})",
-                        pageSize=1000,
-                        pageToken=page_token,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    )
-                    .execute()
-                )
-
-                for f in response.get("files", []):
-                    if f.get("mimeType") == FOLDER_MIME:
-                        queue.append(f["id"])
-                    elif f.get("mimeType") == SHORTCUT_MIME:
-                        target_mime = f.get("shortcutDetails", {}).get("targetMimeType")
-                        if target_mime == FOLDER_MIME:
-                            # Skip folder shortcuts in initial sync. Their target
-                            # tree is outside the monitored parent chain and can
-                            # cause add/delete churn in delta sync classification.
-                            logger.info(f"Skipping folder shortcut in initial sync: {f.get('name')}")
-                        else:
-                            # Shortcut to file — resolve and add
-                            resolved = self.resolve_shortcut(f)
-                            if resolved:
-                                result.append(resolved)
-                            else:
-                                logger.warning(f"Broken shortcut: {f.get('name')} — skipping")
-                    else:
-                        result.append(f)
-
-                page_token = response.get("nextPageToken")
-                if not page_token:
-                    break
-
-        logger.info(f"Listed {len(result)} files in folder tree")
-        return result
-
-    def list_folder_files(self, folder_id: str) -> list[dict]:
-        """Recursively list all non-trashed files under a specific folder.
-
-        Resolves shortcuts. Populates folder name cache for path reconstruction.
-        """
-        result: list[dict] = []
-        queue = [folder_id]
-        visited: set[str] = set()
-        while queue:
-            fid = queue.pop()
-            if fid in visited:
-                continue
-            visited.add(fid)
-            page_token: str | None = None
-            while True:
                 try:
                     response = (
                         self.service.files()
                         .list(
-                            q=f"'{fid}' in parents and trashed = false",
+                            q=f"'{folder_id}' in parents and trashed = false",
                             fields=f"nextPageToken,files({LIST_FILE_FIELDS})",
                             pageSize=1000,
                             pageToken=page_token,
@@ -201,8 +148,11 @@ class DriveClient:
                         .execute()
                     )
                 except Exception:
-                    logger.warning(f"Cannot list children of folder {fid}")
-                    break
+                    if suppress_errors:
+                        logger.warning(f"Cannot list children of folder {folder_id}")
+                        break
+                    raise
+
                 for f in response.get("files", []):
                     if f.get("mimeType") == FOLDER_MIME:
                         self._folder_cache[f["id"]] = f.get("name")
@@ -215,12 +165,30 @@ class DriveClient:
                             resolved = self.resolve_shortcut(f)
                             if resolved:
                                 result.append(resolved)
+                            else:
+                                logger.warning(f"Broken shortcut: {f.get('name')} — skipping")
                     else:
                         result.append(f)
+
                 page_token = response.get("nextPageToken")
                 if not page_token:
                     break
+
         return result
+
+    def list_all_files(self) -> list[dict]:
+        """Recursively list all non-trashed files under the monitored folder."""
+        result = self._list_files_recursive(self.cfg.drive_folder_id)
+        logger.info(f"Listed {len(result)} files in folder tree")
+        return result
+
+    def list_folder_files(self, folder_id: str) -> list[dict]:
+        """Recursively list all non-trashed files under a specific folder.
+
+        Resolves shortcuts. Populates folder name cache for path reconstruction.
+        Suppresses errors so a trashed/inaccessible subfolder doesn't abort.
+        """
+        return self._list_files_recursive(folder_id, suppress_errors=True)
 
     def is_in_folder(self, file_data: dict) -> bool:
         """Check if a file is under the monitored folder by walking parents."""
