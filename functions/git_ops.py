@@ -49,7 +49,14 @@ class GitRepo:
 
         return [re.sub(r"oauth2:[^@]+@", "oauth2:***@", a) for a in args]
 
-    def _run(self, args: list[str], cwd: str | None = None, env: dict | None = None) -> str:
+    def _run(
+        self,
+        args: list[str],
+        cwd: str | None = None,
+        env: dict | None = None,
+        *,
+        log_errors: bool = True,
+    ) -> str:
         """Run a git command and return stdout."""
         cmd_env = os.environ.copy()
         # Prevent git from prompting for credentials
@@ -67,8 +74,9 @@ class GitRepo:
         )
         if result.returncode != 0:
             safe_args = self._redact_args(args)
-            logger.error(f"Git command failed: {' '.join(safe_args)}\nstderr: {result.stderr}")
-            raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+            if log_errors:
+                logger.error(f"Git command failed: {' '.join(safe_args)}\nstderr: {result.stderr}")
+            raise subprocess.CalledProcessError(result.returncode, safe_args, result.stdout, result.stderr)
         return result.stdout
 
     def _configure_identity(self):
@@ -163,12 +171,12 @@ class GitRepo:
         import contextlib
 
         with contextlib.suppress(subprocess.CalledProcessError):
-            self._run(["git", "reset", "HEAD"])
+            self._run(["git", "reset", "HEAD"], log_errors=False)
 
     def has_staged_changes(self) -> bool:
         """Check if there are staged changes."""
         try:
-            self._run(["git", "diff", "--cached", "--quiet"])
+            self._run(["git", "diff", "--cached", "--quiet"], log_errors=False)
             return False
         except subprocess.CalledProcessError:
             return True  # Return code 1 means there are differences

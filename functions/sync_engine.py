@@ -507,28 +507,34 @@ def _cascade_folder_delete(
                 )
     else:
         # Drive API couldn't list children (trashed folder, permission issue).
-        # Fall back to Firestore state: find tracked files whose path starts
-        # with this folder's name.  We use just the folder name (not
-        # get_file_path) because after move-out the folder's parents point
-        # outside the monitored tree, producing a path that won't match
-        # any Firestore entries (which store the old in-tree path).
+        # Fall back to Firestore state: find tracked files under this folder.
+        # We match by folder name as a path component.  To avoid over-deletion
+        # when multiple folders share the same name, we require all matches
+        # to share a single common prefix (e.g. "A/MyFolder/").  If matches
+        # span multiple distinct prefixes, we skip to avoid data loss.
         folder_name = file_data.get("name") if file_data else None
         if folder_name:
-            # Search for "<folder_name>/" prefix in all tracked paths.
-            # get_files_in_folder does a prefix match on the path field.
             all_tracked = state.get_all_files()
+            candidates: dict[str, str] = {}  # file_id → path
             for fid, fdata in all_tracked.items():
                 p = fdata.get("path", "")
-                # Match paths like "FolderName/..." or ".../FolderName/..."
                 if p.startswith(folder_name + "/") or ("/" + folder_name + "/") in p:
-                    changes.append(
-                        Change(
-                            file_id=fid,
-                            change_type=ChangeType.DELETE,
-                            old_path=p,
-                        )
-                    )
-            if changes:
+                    candidates[fid] = p
+
+            # Check for ambiguity: extract the prefix up to and including folder_name
+            prefixes: set[str] = set()
+            for p in candidates.values():
+                idx = p.find(folder_name + "/")
+                prefixes.add(p[: idx + len(folder_name) + 1])
+
+            if len(prefixes) > 1:
+                logger.warning(
+                    f"Folder {folder_name} matches {len(prefixes)} distinct paths — "
+                    f"skipping fallback deletion to avoid ambiguity: {prefixes}"
+                )
+            elif candidates:
+                for fid, p in candidates.items():
+                    changes.append(Change(file_id=fid, change_type=ChangeType.DELETE, old_path=p))
                 logger.info(f"Folder {folder_name} — used state fallback, {len(changes)} tracked files")
         if not changes:
             logger.debug(f"Folder {folder_id} not accessible or empty")

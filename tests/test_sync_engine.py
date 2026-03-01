@@ -2198,6 +2198,24 @@ class TestFolderChangeExpansion:
         assert len(result) == 1
         assert result[0].old_path == "MyFolder/doc.docx"
 
+    def test_folder_cascade_fallback_skips_ambiguous_names(self):
+        """If the same folder name appears in multiple subtrees, skip to avoid data loss."""
+        from sync_engine import _cascade_folder_delete
+
+        mock_drive = MagicMock()
+        mock_drive.list_folder_files.return_value = []
+
+        mock_state = MagicMock()
+        mock_state.get_all_files.return_value = {
+            "c1": {"path": "A/Shared/doc.docx"},
+            "c2": {"path": "B/Shared/other.pdf"},
+        }
+
+        file_data = {"name": "Shared", "parents": ["external"]}
+        result = _cascade_folder_delete("folder1", file_data, mock_drive, mock_state)
+        # Should NOT delete because "Shared" matches two distinct prefixes
+        assert len(result) == 0
+
     def test_folder_in_classify_change_returns_list(self, mock_drive, mock_state):
         """classify_change with folder mimeType returns a list of Changes."""
         from sync_engine import classify_change
