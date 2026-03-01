@@ -126,9 +126,13 @@ class GitRepo:
 
     def rename_file(self, old_path: str, new_path: str):
         """Rename/move a file using git mv."""
+        old_full = os.path.join(self.repo_path, old_path)
         new_full = os.path.join(self.repo_path, new_path)
         os.makedirs(os.path.dirname(new_full), exist_ok=True)
-        self._run(["git", "mv", old_path, new_path])
+        if os.path.exists(old_full):
+            self._run(["git", "mv", old_path, new_path])
+        else:
+            logger.warning(f"rename_file: source not found: {old_path}")
 
     def delete_file(self, rel_path: str):
         """Delete a file using git rm."""

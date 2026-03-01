@@ -685,14 +685,21 @@ class TestMultiAuthorCommit:
         assert "docs/Reports/doc.docx.md" in stage_calls
 
     def test_stage_change_files_delete_stages_old_path(self):
-        """_stage_change_files for DELETE stages the old path."""
+        """_stage_change_files for DELETE stages the old path and extracted path."""
         from sync_engine import Change, ChangeType, _stage_change_files
 
         mock_repo = MagicMock()
+        state = MagicMock()
+        state.get_file.return_value = {
+            "name": "old.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
         change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/old.docx")
-        _stage_change_files(change, mock_repo, "docs")
+        _stage_change_files(change, mock_repo, "docs", state)
 
-        mock_repo.stage_file.assert_called_once_with("docs/Reports/old.docx")
+        stage_calls = [c[0][0] for c in mock_repo.stage_file.call_args_list]
+        assert "docs/Reports/old.docx" in stage_calls
+        assert "docs/Reports/old.docx.md" in stage_calls
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +719,7 @@ class TestResyncLoop:
         from main import _run_sync_loop
 
         mock_state = MagicMock()
+        mock_state.get_watch_channel.return_value = None
         # First call: resync needed. Second call: no resync needed.
         mock_state.is_resync_needed.side_effect = [True, False]
         mock_state.clear_resync_needed.return_value = None
@@ -732,6 +740,7 @@ class TestResyncLoop:
         from main import _run_sync_loop
 
         mock_state = MagicMock()
+        mock_state.get_watch_channel.return_value = None
         # Always says resync needed
         mock_state.is_resync_needed.return_value = True
         mock_state.clear_resync_needed.return_value = None
@@ -752,6 +761,7 @@ class TestResyncLoop:
         from main import _run_sync_loop
 
         mock_state = MagicMock()
+        mock_state.get_watch_channel.return_value = None
         mock_state.is_resync_needed.return_value = False
         mock_state.clear_resync_needed.return_value = None
 
@@ -808,19 +818,21 @@ class TestHandleDelete:
     def test_deletes_original_file(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_delete
 
-        mock_state.get_file.return_value = {"path": "Reports/old.docx", "extracted_path": None}
+        mock_state.get_file.return_value = {"name": "old.docx", "mime_type": "", "path": "Reports/old.docx"}
         mock_repo = MagicMock()
         change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/old.docx")
 
         _handle_delete(change, mock_repo, mock_state, "docs")
-        mock_repo.delete_file.assert_called_once_with("docs/Reports/old.docx")
+        calls = [c[0][0] for c in mock_repo.delete_file.call_args_list]
+        assert "docs/Reports/old.docx" in calls
 
     def test_deletes_extracted_file_too(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_delete
 
         mock_state.get_file.return_value = {
+            "name": "doc.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "path": "Reports/doc.docx",
-            "extracted_path": "Reports/doc.docx.md",
         }
         mock_repo = MagicMock()
         change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="Reports/doc.docx")
@@ -842,12 +854,12 @@ class TestHandleDelete:
     def test_no_extracted_path_only_deletes_original(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_delete
 
-        mock_state.get_file.return_value = {"path": "data.csv", "extracted_path": None}
+        mock_state.get_file.return_value = {"name": "notes.txt", "mime_type": "text/plain", "path": "notes.txt"}
         mock_repo = MagicMock()
-        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="data.csv")
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="notes.txt")
 
         _handle_delete(change, mock_repo, mock_state, "docs")
-        mock_repo.delete_file.assert_called_once_with("docs/data.csv")
+        mock_repo.delete_file.assert_called_once_with("docs/notes.txt")
 
     def test_delete_when_no_state_entry(self, mock_state):
         """Delete still removes the original even when state has no record."""
@@ -858,7 +870,10 @@ class TestHandleDelete:
         change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path="lost.docx")
 
         _handle_delete(change, mock_repo, mock_state, "docs")
-        mock_repo.delete_file.assert_called_once_with("docs/lost.docx")
+        # No state means name comes from basename, mime_type is empty.
+        # .docx extension means extracted .md is also deleted.
+        calls = [c[0][0] for c in mock_repo.delete_file.call_args_list]
+        assert "docs/lost.docx" in calls
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +887,7 @@ class TestHandleRename:
     def test_renames_original_file(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_rename
 
-        mock_state.get_file.return_value = {"path": "old.docx", "extracted_path": None, "md5": "abc123"}
+        mock_state.get_file.return_value = {"name": "old.docx", "path": "old.docx", "mime_type": "", "md5": "abc123"}
         mock_drive = MagicMock()
         mock_repo = MagicMock()
         change = Change(
@@ -884,13 +899,16 @@ class TestHandleRename:
         )
 
         _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
-        mock_repo.rename_file.assert_called_once_with("docs/old.docx", "docs/new.docx")
+        rename_calls = mock_repo.rename_file.call_args_list
+        assert call("docs/old.docx", "docs/new.docx") in rename_calls
 
     def test_renames_extracted_file_too(self, mock_state):
         from sync_engine import Change, ChangeType, _handle_rename
 
         mock_state.get_file.return_value = {
+            "name": "old.docx",
             "path": "old.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "extracted_path": "old.docx.md",
             "md5": "abc123",
         }
@@ -913,7 +931,9 @@ class TestHandleRename:
         from sync_engine import Change, ChangeType, _handle_rename
 
         mock_state.get_file.return_value = {
+            "name": "doc.docx",
             "path": "doc.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "extracted_path": "doc.docx.md",
             "md5": "abc123",
         }
@@ -1231,7 +1251,9 @@ class TestProcessChanges:
         from sync_engine import Change, ChangeType, process_changes
 
         mock_state.get_file.return_value = {
+            "name": "old.docx",
             "path": "old.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "extracted_path": "old.docx.md",
             "md5": "abc123",
         }
@@ -1671,7 +1693,9 @@ class TestHandleRenameWithContentChange:
 
         # Existing state with old md5
         mock_state.get_file.return_value = {
+            "name": "old_report.docx",
             "path": "old_report.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "extracted_path": "old_report.docx.md",
             "md5": "old_md5",
         }
@@ -1713,9 +1737,12 @@ class TestHandleRenameWithContentChange:
 
         # Existing state for a Google Doc (no md5)
         mock_state.get_file.return_value = {
+            "name": "Old Title",
             "path": "Old Title",
+            "mime_type": "application/vnd.google-apps.document",
             "extracted_path": "Old Title.docx.md",
             "md5": None,
+            "modified_time": "2025-01-01T00:00:00Z",
         }
 
         mock_drive = MagicMock()
@@ -1738,12 +1765,12 @@ class TestHandleRenameWithContentChange:
 
         _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
 
-        # Files were renamed
+        # Files were renamed using git paths (with .docx extension)
         rename_calls = mock_repo.rename_file.call_args_list
-        assert call("docs/Old Title", "docs/New Title") in rename_calls
+        assert call("docs/Old Title.docx", "docs/New Title.docx") in rename_calls
         assert call("docs/Old Title.docx.md", "docs/New Title.docx.md") in rename_calls
 
-        # Google-native: no md5, so always re-extracts
+        # Google-native: no md5, modifiedTime changed, so re-extracts
         mock_drive.export_file.assert_called_once_with(
             "f1",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

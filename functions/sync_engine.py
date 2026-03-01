@@ -17,6 +17,22 @@ from text_extractor import extract_text, get_extracted_filename
 logger = logging.getLogger(__name__)
 
 
+def _git_paths(logical_path: str, name: str, mime_type: str) -> tuple[str, str | None]:
+    """Convert Drive logical path to (original_git_path, extracted_git_path).
+
+    For Google-native files, original includes the export extension.
+    """
+    dir_part = os.path.dirname(logical_path)
+    if mime_type in NATIVE_EXPORTS:
+        _, ext, _ = NATIVE_EXPORTS[mime_type]
+        original = os.path.join(dir_part, name + ext) if dir_part else name + ext
+    else:
+        original = logical_path
+    extracted_name = get_extracted_filename(name, mime_type or None)
+    extracted = (os.path.join(dir_part, extracted_name) if dir_part else extracted_name) if extracted_name else None
+    return original, extracted
+
+
 class ChangeType:
     ADD = "add"
     MODIFY = "modify"
@@ -167,7 +183,7 @@ def run_initial_sync(
             repo.unstage_all()
             for group in author_groups:
                 for change in group.files:
-                    _stage_change_files(change, repo, cfg.docs_subdir)
+                    _stage_change_files(change, repo, cfg.docs_subdir, state)
                 if repo.has_staged_changes():
                     repo.commit(group.message, group.author_name, group.author_email)
 
@@ -216,9 +232,23 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     # Classify each change
     changes: list[Change] = []
     for file_id, raw in deduped.items():
-        change = classify_change(file_id, raw, drive, state)
-        if change and change.change_type != ChangeType.SKIP:
-            changes.append(change)
+        result = classify_change(file_id, raw, drive, state)
+        if result is None:
+            continue
+        if isinstance(result, list):
+            changes.extend(c for c in result if c.change_type != ChangeType.SKIP)
+        elif result.change_type != ChangeType.SKIP:
+            changes.append(result)
+
+    # Dedup: prefer direct changes (with file_data) over synthetic MOVEs/DELETEs
+    seen: dict[str, Change] = {}
+    for c in changes:
+        if c.file_id in seen:
+            if c.file_data is not None:
+                seen[c.file_id] = c
+        else:
+            seen[c.file_id] = c
+    changes = list(seen.values())
 
     if not changes:
         state.set_page_token(new_token)
@@ -247,7 +277,7 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
             repo.unstage_all()
             for group in author_groups:
                 for change in group.files:
-                    _stage_change_files(change, repo, cfg.docs_subdir)
+                    _stage_change_files(change, repo, cfg.docs_subdir, state)
                 if repo.has_staged_changes():
                     repo.commit(group.message, group.author_name, group.author_email)
 
@@ -263,7 +293,7 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     return len(processed)
 
 
-def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateManager) -> Change | None:
+def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateManager) -> Change | list[Change] | None:
     """Classify a Drive change into an action type."""
     removed = raw.get("removed", False)
     file_data = raw.get("file", {})
@@ -290,10 +320,9 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
             )
         return None  # Unknown file deleted, nothing to do
 
-    # Skip folders — they appear in the changes feed but can't be downloaded
+    # Folders — expand to child file changes (renames, moves, deletes)
     if file_data.get("mimeType") == FOLDER_MIME:
-        logger.debug(f"Skipping folder {file_data.get('name', file_id)}")
-        return None
+        return _handle_folder_change(file_id, file_data, drive, state)
 
     # Resolve shortcuts — replace file_data with target metadata
     if file_data.get("mimeType") == SHORTCUT_MIME:
@@ -412,6 +441,68 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
     return Change(file_id=file_id, change_type=ChangeType.SKIP)
 
 
+def _handle_folder_change(
+    folder_id: str, file_data: dict, drive: DriveClient, state: StateManager
+) -> list[Change] | None:
+    """Expand a folder change into child file moves or deletes."""
+    if not drive.is_in_folder(file_data):
+        return _cascade_folder_delete(folder_id, drive, state)
+
+    children = drive.list_folder_files(folder_id)
+    if not children:
+        logger.debug(f"Folder {file_data.get('name')} — no children to move")
+        return []
+
+    last_user = file_data.get("lastModifyingUser", {})
+    changes: list[Change] = []
+    for child in children:
+        child_id = child["id"]
+        existing = state.get_file(child_id)
+        if not existing:
+            continue
+        old_path = existing.get("path")
+        new_path = drive.get_file_path(child)
+        if old_path and new_path and old_path != new_path:
+            changes.append(
+                Change(
+                    file_id=child_id,
+                    change_type=ChangeType.MOVE,
+                    file_data=None,
+                    old_path=old_path,
+                    new_path=new_path,
+                    author_name=last_user.get("displayName"),
+                    author_email=last_user.get("emailAddress"),
+                )
+            )
+    if changes:
+        logger.info(f"Folder rename expanded to {len(changes)} file moves")
+    else:
+        logger.debug(f"Folder {file_data.get('name')} — no tracked files with changed paths")
+    return changes
+
+
+def _cascade_folder_delete(folder_id: str, drive: DriveClient, state: StateManager) -> list[Change]:
+    """Folder moved out of monitored tree — delete all tracked children."""
+    children = drive.list_folder_files(folder_id)
+    if not children:
+        logger.debug(f"Folder {folder_id} not accessible or empty")
+        return []
+    changes: list[Change] = []
+    for child in children:
+        existing = state.get_file(child["id"])
+        if existing:
+            changes.append(
+                Change(
+                    file_id=child["id"],
+                    change_type=ChangeType.DELETE,
+                    old_path=existing.get("path"),
+                )
+            )
+    if changes:
+        logger.info(f"Folder moved out — deleting {len(changes)} tracked files")
+    return changes
+
+
 def process_changes(
     changes: list[Change],
     drive: DriveClient,
@@ -449,13 +540,13 @@ def _handle_delete(change: Change, repo: GitRepo, state: StateManager, docs_subd
         return
 
     existing = state.get_file(change.file_id)
-    original_rel = os.path.join(docs_subdir, change.old_path)
-    repo.delete_file(original_rel)
+    name = existing.get("name", os.path.basename(change.old_path)) if existing else os.path.basename(change.old_path)
+    mime_type = existing.get("mime_type", "") if existing else ""
+    original, extracted = _git_paths(change.old_path, name, mime_type)
 
-    # Also delete extracted file if it exists
-    if existing and existing.get("extracted_path"):
-        extracted_rel = os.path.join(docs_subdir, existing["extracted_path"])
-        repo.delete_file(extracted_rel)
+    repo.delete_file(os.path.join(docs_subdir, original))
+    if extracted:
+        repo.delete_file(os.path.join(docs_subdir, extracted))
 
     logger.info(f"Deleted {change.old_path}")
 
@@ -464,36 +555,38 @@ def _handle_rename(change: Change, drive: DriveClient, repo: GitRepo, state: Sta
     """Rename/move files using git mv, then update content if also modified."""
     if not change.old_path or not change.new_path:
         return
-    old_rel = os.path.join(docs_subdir, change.old_path)
-    new_rel = os.path.join(docs_subdir, change.new_path)
 
-    repo.rename_file(old_rel, new_rel)
-
-    # Also rename extracted file
     existing = state.get_file(change.file_id)
-    if existing and existing.get("extracted_path"):
-        old_extracted = os.path.join(docs_subdir, existing["extracted_path"])
-        # Compute new extracted filename
-        mime_type = change.file_data.get("mimeType") if change.file_data else None
-        new_name = change.file_data.get("name", "") if change.file_data else ""
-        new_extracted_name = get_extracted_filename(new_name, mime_type)
-        if new_extracted_name:
-            # Build new extracted path preserving directory
-            new_dir = os.path.dirname(change.new_path)
-            new_extracted_path = os.path.join(new_dir, new_extracted_name) if new_dir else new_extracted_name
-            new_extracted_rel = os.path.join(docs_subdir, new_extracted_path)
-            repo.rename_file(old_extracted, new_extracted_rel)
 
-    # If content also changed, re-download and extract
     if change.file_data:
+        mime_type = change.file_data.get("mimeType", "")
+        new_name = change.file_data.get("name", "")
+    elif existing:
+        mime_type = existing.get("mime_type", "")
+        new_name = existing.get("name", "")
+    else:
+        mime_type = ""
+        new_name = os.path.basename(change.new_path)
+
+    old_name = (
+        existing.get("name", os.path.basename(change.old_path)) if existing else os.path.basename(change.old_path)
+    )
+
+    old_original, old_extracted = _git_paths(change.old_path, old_name, mime_type)
+    new_original, new_extracted = _git_paths(change.new_path, new_name, mime_type)
+
+    repo.rename_file(os.path.join(docs_subdir, old_original), os.path.join(docs_subdir, new_original))
+    if old_extracted and new_extracted:
+        repo.rename_file(os.path.join(docs_subdir, old_extracted), os.path.join(docs_subdir, new_extracted))
+
+    # Re-download only if content changed (skip for synthetic folder-expansion MOVEs where file_data=None)
+    if change.file_data and existing:
         md5 = change.file_data.get("md5Checksum")
-        if existing:
-            old_md5 = existing.get("md5")
-            if md5 and md5 != old_md5:
-                _download_and_extract(change, drive, repo, docs_subdir)
-            elif not md5:
-                # Google-native: always re-extract on rename (modifiedTime likely changed)
-                _download_and_extract(change, drive, repo, docs_subdir)
+        old_md5 = existing.get("md5")
+        if (md5 and md5 != old_md5) or (
+            not md5 and change.file_data.get("modifiedTime") != existing.get("modified_time")
+        ):
+            _download_and_extract(change, drive, repo, docs_subdir)
 
     logger.info(f"Renamed {change.old_path} → {change.new_path}")
 
@@ -615,39 +708,54 @@ def group_by_author(changes: list[Change], cfg) -> list[AuthorCommit]:
     return list(groups.values())
 
 
-def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str):
+def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str, state: StateManager | None = None):
     """Stage the files associated with a change (for multi-author commits)."""
     if change.change_type == ChangeType.DELETE:
-        if change.old_path:
-            repo.stage_file(os.path.join(docs_subdir, change.old_path))
+        if not change.old_path:
+            return
+        existing = state.get_file(change.file_id) if state else None
+        name = (
+            existing.get("name", os.path.basename(change.old_path)) if existing else os.path.basename(change.old_path)
+        )
+        mime_type = existing.get("mime_type", "") if existing else ""
+        original, extracted = _git_paths(change.old_path, name, mime_type)
+        repo.stage_file(os.path.join(docs_subdir, original))
+        if extracted:
+            repo.stage_file(os.path.join(docs_subdir, extracted))
+
     elif change.change_type in (ChangeType.RENAME, ChangeType.MOVE):
+        existing = state.get_file(change.file_id) if state else None
+        mime_type = (
+            change.file_data.get("mimeType", "")
+            if change.file_data
+            else (existing.get("mime_type", "") if existing else "")
+        )
+        old_name = existing.get("name", "") if existing else os.path.basename(change.old_path or "")
+        new_name = (
+            change.file_data.get("name", "") if change.file_data else (existing.get("name", "") if existing else "")
+        )
         if change.old_path:
-            repo.stage_file(os.path.join(docs_subdir, change.old_path))
+            old_orig, old_ext = _git_paths(change.old_path, old_name, mime_type)
+            repo.stage_file(os.path.join(docs_subdir, old_orig))
+            if old_ext:
+                repo.stage_file(os.path.join(docs_subdir, old_ext))
         if change.new_path:
-            repo.stage_file(os.path.join(docs_subdir, change.new_path))
+            new_orig, new_ext = _git_paths(change.new_path, new_name, mime_type)
+            repo.stage_file(os.path.join(docs_subdir, new_orig))
+            if new_ext:
+                repo.stage_file(os.path.join(docs_subdir, new_ext))
+
     else:
         if change.new_path and change.file_data:
             # For Google-native files, _download_and_extract writes to
             # name + export extension (e.g. "My Doc.docx"), not new_path
             # ("My Doc").  Compute the actual path so we stage the right file.
             mime_type = change.file_data.get("mimeType", "")
-            if mime_type in NATIVE_EXPORTS:
-                _, ext, _ = NATIVE_EXPORTS[mime_type]
-                name = change.file_data.get("name", "")
-                exported_name = name + ext
-                dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
-                original_path = os.path.join(dir_part, exported_name) if dir_part else exported_name
-                repo.stage_file(os.path.join(docs_subdir, original_path))
-            else:
-                repo.stage_file(os.path.join(docs_subdir, change.new_path))
-            # Also stage extracted file
             name = change.file_data.get("name", "")
-            mime_type = change.file_data.get("mimeType", "")
-            extracted_name = get_extracted_filename(name, mime_type)
-            if extracted_name:
-                dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
-                extracted_path = os.path.join(dir_part, extracted_name) if dir_part else extracted_name
-                repo.stage_file(os.path.join(docs_subdir, extracted_path))
+            original, extracted = _git_paths(change.new_path, name, mime_type)
+            repo.stage_file(os.path.join(docs_subdir, original))
+            if extracted:
+                repo.stage_file(os.path.join(docs_subdir, extracted))
         elif change.new_path:
             repo.stage_file(os.path.join(docs_subdir, change.new_path))
 
@@ -659,6 +767,35 @@ def update_file_state(change: Change, state: StateManager):
         return
 
     file_data = change.file_data or {}
+
+    if change.change_type in (ChangeType.RENAME, ChangeType.MOVE):
+        existing = state.get_file(change.file_id) or {}
+        state_data = dict(existing)
+        state_data["path"] = change.new_path or existing.get("path", "")
+        if file_data.get("name"):
+            state_data["name"] = file_data["name"]
+        # Recompute extracted_path
+        name = state_data.get("name", "")
+        mime_type = file_data.get("mimeType") or state_data.get("mime_type", "")
+        extracted_name = get_extracted_filename(name, mime_type)
+        dir_part = os.path.dirname(state_data["path"])
+        state_data["extracted_path"] = (
+            (os.path.join(dir_part, extracted_name) if dir_part else extracted_name) if extracted_name else None
+        )
+        if file_data.get("md5Checksum"):
+            state_data["md5"] = file_data["md5Checksum"]
+        if file_data.get("modifiedTime"):
+            state_data["modified_time"] = file_data["modifiedTime"]
+        if file_data.get("mimeType"):
+            state_data["mime_type"] = file_data["mimeType"]
+        last_user = file_data.get("lastModifyingUser", {})
+        if last_user.get("displayName"):
+            state_data["last_modified_by_name"] = last_user["displayName"]
+            state_data["last_modified_by_email"] = last_user.get("emailAddress")
+        state.set_file(change.file_id, state_data)
+        return
+
+    # ADD/MODIFY — full-write logic
     name = file_data.get("name", "")
     mime_type = file_data.get("mimeType", "")
     path = change.new_path or ""

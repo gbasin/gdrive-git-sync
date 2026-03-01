@@ -9,6 +9,7 @@ Three functions:
 import json
 import logging
 import os
+import time
 
 import functions_framework
 from flask import Request
@@ -105,8 +106,14 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3):
 
     Caps iterations to prevent unbounded looping from continuous edits.
     After max_iterations, any remaining changes wait for the next webhook
-    or the 4-hour safety-net.
+    or the hourly safety-net.
     """
+    watch_info = state.get_watch_channel()
+    if not watch_info:
+        logger.warning("No watch channel — relying on safety-net only")
+    elif watch_info.get("expiration", 0) < time.time() * 1000:
+        logger.warning("Watch channel expired")
+
     for i in range(max_iterations):
         state.clear_resync_needed()
         repo = GitRepo()

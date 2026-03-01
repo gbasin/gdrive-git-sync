@@ -17,11 +17,11 @@ resource "google_cloud_scheduler_job" "renew_watch" {
   }
 }
 
-# Safety-net sync every 4 hours (catches missed notifications)
+# Safety-net sync every hour (catches missed notifications)
 resource "google_cloud_scheduler_job" "safety_net" {
   name             = "drive-sync-safety-net"
   description      = "Periodic catchup sync in case notifications were missed"
-  schedule         = "0 */4 * * *" # Every 4 hours
+  schedule         = "0 * * * *" # Every hour
   time_zone        = "UTC"
   attempt_deadline = "300s"
 

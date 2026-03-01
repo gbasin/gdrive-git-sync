@@ -172,6 +172,56 @@ class DriveClient:
         logger.info(f"Listed {len(result)} files in folder tree")
         return result
 
+    def list_folder_files(self, folder_id: str) -> list[dict]:
+        """Recursively list all non-trashed files under a specific folder.
+
+        Resolves shortcuts. Populates folder name cache for path reconstruction.
+        """
+        result: list[dict] = []
+        queue = [folder_id]
+        visited: set[str] = set()
+        while queue:
+            fid = queue.pop()
+            if fid in visited:
+                continue
+            visited.add(fid)
+            page_token: str | None = None
+            while True:
+                try:
+                    response = (
+                        self.service.files()
+                        .list(
+                            q=f"'{fid}' in parents and trashed = false",
+                            fields=f"nextPageToken,files({LIST_FILE_FIELDS})",
+                            pageSize=1000,
+                            pageToken=page_token,
+                            supportsAllDrives=True,
+                            includeItemsFromAllDrives=True,
+                        )
+                        .execute()
+                    )
+                except Exception:
+                    logger.warning(f"Cannot list children of folder {fid}")
+                    break
+                for f in response.get("files", []):
+                    if f.get("mimeType") == FOLDER_MIME:
+                        self._folder_cache[f["id"]] = f.get("name")
+                        queue.append(f["id"])
+                    elif f.get("mimeType") == SHORTCUT_MIME:
+                        target_mime = f.get("shortcutDetails", {}).get("targetMimeType")
+                        if target_mime == FOLDER_MIME:
+                            logger.debug(f"Skipping folder shortcut: {f.get('name')}")
+                        else:
+                            resolved = self.resolve_shortcut(f)
+                            if resolved:
+                                result.append(resolved)
+                    else:
+                        result.append(f)
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+        return result
+
     def is_in_folder(self, file_data: dict) -> bool:
         """Check if a file is under the monitored folder by walking parents."""
         parents = file_data.get("parents")

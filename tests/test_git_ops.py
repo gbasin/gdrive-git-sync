@@ -154,13 +154,26 @@ class TestRenameFile:
     def test_rename_calls_git_mv(self, mock_run, git_repo):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
-        # Create repo dir for makedirs call
-        os.makedirs(git_repo.repo_path, exist_ok=True)
+        # Create repo dir and source file so existence check passes
+        old_full = os.path.join(git_repo.repo_path, "old/file.txt")
+        os.makedirs(os.path.dirname(old_full), exist_ok=True)
+        with open(old_full, "w") as f:
+            f.write("content")
 
         git_repo.rename_file("old/file.txt", "new/file.txt")
 
         args = mock_run.call_args[0][0]
         assert args == ["git", "mv", "old/file.txt", "new/file.txt"]
+
+    @patch("git_ops.subprocess.run")
+    def test_rename_skips_missing_source(self, mock_run, git_repo):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        os.makedirs(git_repo.repo_path, exist_ok=True)
+
+        git_repo.rename_file("nonexistent/file.txt", "new/file.txt")
+
+        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
