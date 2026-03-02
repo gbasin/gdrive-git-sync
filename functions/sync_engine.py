@@ -105,9 +105,12 @@ def run_initial_sync(
         logger.info("Force flag set — clearing tracked file state")
         state.clear_all_files()
 
-    if not all_files:
+    if not all_files and not force:
         logger.info("No files found in Drive folder")
         return {"count": 0, "debug": debug}
+
+    # Build expected git paths from Drive listing (for orphan cleanup)
+    expected_git_paths: set[str] = set()
 
     # Build Change objects, skipping files already tracked in Firestore
     changes: list[Change] = []
@@ -126,6 +129,16 @@ def run_initial_sync(
         if skip_reason:
             logger.info(f"Skipping {rel_path}: {skip_reason}")
             continue
+
+        # Track expected git paths for orphan cleanup
+        name = file_data.get("name", "")
+        mime_type = file_data.get("mimeType", "")
+        original, extracted = _git_paths(rel_path, name, mime_type)
+        full_original = os.path.join(cfg.docs_subdir, original) if cfg.docs_subdir else original
+        expected_git_paths.add(full_original)
+        if extracted:
+            full_extracted = os.path.join(cfg.docs_subdir, extracted) if cfg.docs_subdir else extracted
+            expected_git_paths.add(full_extracted)
 
         # Idempotency: check if already tracked with same content
         existing = state.get_file(file_id)
@@ -153,15 +166,15 @@ def run_initial_sync(
             )
         )
 
-    if not changes:
+    # Clone (handles empty repos) — needed for both changes and orphan cleanup
+    repo.clone_or_init()
+
+    if not changes and not force:
         logger.info("All files already tracked — nothing to sync")
         debug["already_tracked"] = already_tracked
         return {"count": 0, "debug": debug}
 
-    logger.info(f"Initial sync: {len(changes)} files to process")
-
-    # Clone (handles empty repos)
-    repo.clone_or_init()
+    logger.info(f"Initial sync: {len(changes)} files to process, {already_tracked} already tracked")
 
     processed, had_failures = process_changes(changes, drive, repo, state, cfg)
     if had_failures:
@@ -190,15 +203,41 @@ def run_initial_sync(
                 if repo.has_staged_changes():
                     repo.commit(group.message, group.author_name, group.author_email)
 
-        repo.push_if_ahead()
+    # Orphan cleanup: remove git files not found in Drive listing
+    orphans_removed = 0
+    if force and expected_git_paths:
+        tracked_files = repo.list_tracked_files()
+        for git_path in tracked_files:
+            if git_path not in expected_git_paths:
+                repo.delete_file(git_path)
+                orphans_removed += 1
+                logger.info(f"Removing orphaned file: {git_path}")
+        if orphans_removed:
+            repo.stage_file(".")
+            if repo.has_staged_changes():
+                repo.commit(
+                    f"Remove {orphans_removed} orphaned files not in Drive",
+                    cfg.commit_author_name,
+                    cfg.commit_author_email,
+                )
+            debug["orphans_removed"] = orphans_removed
+            # Clean up Firestore: remove state entries whose paths don't match Drive
+            all_state = state.get_all_files()
+            for file_id, data in all_state.items():
+                path = data.get("path", "")
+                full_path = os.path.join(cfg.docs_subdir, path) if cfg.docs_subdir else path
+                if full_path not in expected_git_paths:
+                    state.delete_file(file_id)
 
-        # Update Firestore state after push (or after confirming remote
-        # is already up to date).  If push_if_ahead() raises, this loop
-        # is skipped — the next run will re-download and retry.
-        for change in processed:
-            update_file_state(change, state)
+    repo.push_if_ahead()
 
-    logger.info(f"Initial sync complete: {len(processed)} files committed")
+    # Update Firestore state after push (or after confirming remote
+    # is already up to date).  If push_if_ahead() raises, this loop
+    # is skipped — the next run will re-download and retry.
+    for change in processed:
+        update_file_state(change, state)
+
+    logger.info(f"Initial sync complete: {len(processed)} files synced, {orphans_removed} orphans removed")
     debug["files_synced"] = len(processed)
     return {"count": len(processed), "debug": debug}
 

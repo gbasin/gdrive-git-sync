@@ -257,6 +257,11 @@ class GitRepo:
         if any_committed:
             self.push()
 
+    def list_tracked_files(self) -> list[str]:
+        """Return all tracked file paths relative to repo root."""
+        output = self._run(["git", "ls-files"])
+        return [line for line in output.splitlines() if line]
+
     def cleanup(self):
         """Remove the working directory."""
         if os.path.exists(self.work_dir):
