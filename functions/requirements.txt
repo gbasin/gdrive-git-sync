@@ -2,6 +2,7 @@ functions-framework==3.*
 google-api-python-client==2.*
 google-auth==2.*
 google-cloud-firestore==2.*
+google-cloud-logging==3.*
 google-cloud-secret-manager==2.*
 gitpython==3.*
 pypandoc-binary==1.*

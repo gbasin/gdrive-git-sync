@@ -1,8 +1,8 @@
-# Renew watch channel every 6 days (max channel lifetime is 7 days)
+# Renew watch channel daily (max channel lifetime is 7 days, idempotent)
 resource "google_cloud_scheduler_job" "renew_watch" {
   name             = "drive-sync-renew-watch"
   description      = "Renew Drive push notification channel"
-  schedule         = "0 3 */6 * *" # Every 6 days at 3 AM
+  schedule         = "0 3 * * *" # Daily at 3 AM UTC
   time_zone        = "UTC"
   attempt_deadline = "300s"
 

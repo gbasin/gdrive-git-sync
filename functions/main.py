@@ -19,7 +19,15 @@ from git_ops import GitRepo
 from state_manager import StateManager
 from sync_engine import run_initial_sync, run_sync
 
-logging.basicConfig(level=logging.INFO)
+# Use Cloud Logging in production for proper severity mapping;
+# fall back to basicConfig for local development.
+try:
+    import google.cloud.logging as cloud_logging
+
+    cloud_logging.Client().setup_logging(log_level=logging.INFO)
+except Exception:
+    logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 # Google domain verification file content (set via env var during bootstrap)
