@@ -17,11 +17,12 @@ resource "google_cloud_scheduler_job" "renew_watch" {
   }
 }
 
-# Safety-net sync every hour (catches missed notifications)
+# Safety-net sync every 15 minutes (primary sync mechanism when
+# the changes API doesn't work for the service account)
 resource "google_cloud_scheduler_job" "safety_net" {
   name             = "drive-sync-safety-net"
   description      = "Periodic catchup sync in case notifications were missed"
-  schedule         = "0 * * * *" # Every hour
+  schedule         = "*/15 * * * *" # Every 15 minutes
   time_zone        = "UTC"
   attempt_deadline = "300s"
 

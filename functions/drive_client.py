@@ -3,6 +3,7 @@
 import fnmatch
 import io
 import logging
+import time
 import uuid
 
 import google.auth
@@ -329,10 +330,14 @@ class DriveClient:
         Returns dict with channel_id, resource_id, expiration.
         """
         channel_id = str(uuid.uuid4())
+        # Request max lifetime (7 days); Google may cap it shorter.
+        # Without this, the default is only ~1 hour.
+        expiration_ms = int((time.time() + 7 * 24 * 3600) * 1000)
         body = {
             "id": channel_id,
             "type": "web_hook",
             "address": webhook_url,
+            "expiration": expiration_ms,
         }
         response = (
             self.service.changes()
