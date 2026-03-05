@@ -17,7 +17,7 @@ from flask import Request
 from drive_client import DriveClient
 from git_ops import GitRepo
 from state_manager import StateManager
-from sync_engine import run_initial_sync, run_sync
+from sync_engine import run_diff_sync, run_initial_sync, run_sync
 
 # Use Cloud Logging in production for proper severity mapping;
 # fall back to basicConfig for local development.
@@ -115,6 +115,9 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3):
     Caps iterations to prevent unbounded looping from continuous edits.
     After max_iterations, any remaining changes wait for the next webhook
     or the hourly safety-net.
+
+    When the Drive changes API returns nothing (common with service accounts
+    accessing shared folders), falls back to a full-listing diff sync.
     """
     watch_info = state.get_watch_channel()
     if not watch_info:
@@ -124,11 +127,19 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3):
 
     for i in range(max_iterations):
         state.clear_resync_needed()
+        drive = DriveClient()
         repo = GitRepo()
         try:
-            drive = DriveClient()
             count = run_sync(drive, state, repo)
             logger.info(f"Sync iteration {i + 1}: {count} changes")
+
+            # If the changes API found nothing on the first pass, fall back
+            # to a full-listing comparison.  This catches changes that don't
+            # appear in the service account's change feed (shared folders).
+            if count == 0 and i == 0:
+                diff_count = run_diff_sync(drive, state, repo)
+                if diff_count > 0:
+                    logger.info(f"Diff sync found {diff_count} changes missed by changes API")
         finally:
             repo.cleanup()
 

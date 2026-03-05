@@ -339,6 +339,157 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     return len(processed)
 
 
+def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
+    """Sync by comparing full Drive listing against Firestore state.
+
+    Fallback for when ``changes.list`` returns nothing — e.g. a service
+    account whose change feed doesn't include files in a shared folder.
+    Detects ADD, MODIFY, DELETE, and RENAME/MOVE by diffing the live
+    listing against persisted state.
+    """
+    cfg = get_config()
+    _resolve_docs_subdir(drive, cfg)
+
+    all_files = drive.list_all_files()
+    all_state = state.get_all_files()
+
+    if not all_files and not all_state:
+        logger.info("Diff sync: no files in Drive or state")
+        return 0
+
+    # Build map of file_id → (file_data, rel_path) for Drive listing
+    drive_map: dict[str, tuple[dict, str]] = {}
+    for f in all_files:
+        rel_path = drive.get_file_path(f)
+        if drive.matches_exclude_pattern(rel_path):
+            continue
+        if drive.should_skip_file(f):
+            continue
+        drive_map[f["id"]] = (f, rel_path)
+
+    changes: list[Change] = []
+
+    for file_id, (file_data, rel_path) in drive_map.items():
+        existing = state.get_file(file_id)
+        last_user = file_data.get("lastModifyingUser", {})
+        author_name = last_user.get("displayName")
+        author_email = last_user.get("emailAddress")
+
+        if not existing:
+            # New file
+            changes.append(
+                Change(
+                    file_id=file_id,
+                    change_type=ChangeType.ADD,
+                    file_data=file_data,
+                    new_path=rel_path,
+                    author_name=author_name,
+                    author_email=author_email,
+                )
+            )
+            continue
+
+        old_path = existing.get("path")
+
+        # Rename or move
+        if old_path and old_path != rel_path:
+            old_name = existing.get("name")
+            new_name = file_data.get("name")
+            change_type = ChangeType.RENAME if old_name != new_name else ChangeType.MOVE
+            changes.append(
+                Change(
+                    file_id=file_id,
+                    change_type=change_type,
+                    file_data=file_data,
+                    old_path=old_path,
+                    new_path=rel_path,
+                    author_name=author_name,
+                    author_email=author_email,
+                )
+            )
+            continue
+
+        # Content change
+        md5 = file_data.get("md5Checksum")
+        if md5:
+            if md5 != existing.get("md5"):
+                changes.append(
+                    Change(
+                        file_id=file_id,
+                        change_type=ChangeType.MODIFY,
+                        file_data=file_data,
+                        new_path=rel_path,
+                        author_name=author_name,
+                        author_email=author_email,
+                    )
+                )
+        else:
+            # Google-native file — compare modifiedTime
+            if file_data.get("modifiedTime") != existing.get("modified_time"):
+                changes.append(
+                    Change(
+                        file_id=file_id,
+                        change_type=ChangeType.MODIFY,
+                        file_data=file_data,
+                        new_path=rel_path,
+                        author_name=author_name,
+                        author_email=author_email,
+                    )
+                )
+
+    # Detect deletes: files in Firestore but not in Drive listing
+    for file_id, data in all_state.items():
+        if file_id not in drive_map:
+            changes.append(
+                Change(
+                    file_id=file_id,
+                    change_type=ChangeType.DELETE,
+                    old_path=data.get("path"),
+                )
+            )
+
+    if not changes:
+        logger.info("Diff sync: no changes detected")
+        return 0
+
+    logger.info(f"Diff sync: {len(changes)} changes detected")
+
+    repo.clone_or_init()
+    processed, had_failures = process_changes(changes, drive, repo, state, cfg)
+
+    if processed:
+        author_groups = group_by_author(processed, cfg)
+
+        if len(author_groups) == 1:
+            group = author_groups[0]
+            if repo.has_staged_changes():
+                repo.commit(group.message, group.author_name, group.author_email)
+        else:
+            repo.unstage_all()
+            for group in author_groups:
+                for change in group.files:
+                    _stage_change_files(change, repo, cfg.docs_subdir, state)
+                if repo.has_staged_changes():
+                    repo.commit(group.message, group.author_name, group.author_email)
+
+        repo.push()
+
+        for change in processed:
+            update_file_state(change, state)
+
+    # Advance page token so the next run_sync doesn't re-examine stale deltas
+    try:
+        state.set_page_token(drive.get_start_page_token())
+    except Exception:
+        logger.warning("Could not advance page token after diff sync", exc_info=True)
+
+    if had_failures:
+        logger.warning(f"Diff sync: {len(changes) - len(processed)} failures")
+
+    logger.info(f"Diff sync complete: {len(processed)} changes committed")
+    return len(processed)
+
+
 def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateManager) -> Change | list[Change] | None:
     """Classify a Drive change into an action type."""
     removed = raw.get("removed", False)
