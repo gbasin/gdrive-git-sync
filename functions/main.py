@@ -97,8 +97,13 @@ def sync_handler(request: Request):
             logger.info("Another sync is in progress, flagged for resync")
             return "OK", 200
 
+        # Only fall back to diff sync for scheduler/manual triggers (no
+        # channel_id).  Webhooks use the changes API only — running diff
+        # sync on every webhook risks false deletes when the Drive listing
+        # is transiently incomplete.
+        allow_diff_sync = not channel_id
         try:
-            _run_sync_loop(state)
+            _run_sync_loop(state, allow_diff_sync=allow_diff_sync)
         finally:
             state.release_lock()
 
@@ -109,15 +114,18 @@ def sync_handler(request: Request):
     return "OK", 200
 
 
-def _run_sync_loop(state: StateManager, max_iterations: int = 3):
+def _run_sync_loop(state: StateManager, max_iterations: int = 3, *, allow_diff_sync: bool = False):
     """Run sync, then re-run if more webhooks arrived during processing.
 
     Caps iterations to prevent unbounded looping from continuous edits.
     After max_iterations, any remaining changes wait for the next webhook
-    or the hourly safety-net.
+    or the safety-net scheduler.
 
-    When the Drive changes API returns nothing (common with service accounts
-    accessing shared folders), falls back to a full-listing diff sync.
+    Args:
+        allow_diff_sync: When True (safety-net/manual triggers only), fall
+            back to a full-listing diff sync if the changes API returns
+            nothing.  Disabled for webhooks to prevent false deletes when
+            the Drive listing is transiently incomplete.
     """
     watch_info = state.get_watch_channel()
     if not watch_info:
@@ -133,10 +141,11 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3):
             count = run_sync(drive, state, repo)
             logger.info(f"Sync iteration {i + 1}: {count} changes")
 
-            # If the changes API found nothing on the first pass, fall back
-            # to a full-listing comparison.  This catches changes that don't
-            # appear in the service account's change feed (shared folders).
-            if count == 0 and i == 0:
+            # Fall back to full-listing comparison only on safety-net/manual
+            # triggers. This catches changes that the service account's
+            # change feed misses (shared folders), without the risk of false
+            # deletes from transient Drive API issues on every webhook.
+            if count == 0 and i == 0 and allow_diff_sync:
                 diff_count = run_diff_sync(drive, state, repo)
                 if diff_count > 0:
                     logger.info(f"Diff sync found {diff_count} changes missed by changes API")

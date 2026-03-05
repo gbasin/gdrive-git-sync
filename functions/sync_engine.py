@@ -357,6 +357,15 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
         logger.info("Diff sync: no files in Drive or state")
         return 0
 
+    # Safety guard: if Drive returns nothing but we have tracked files,
+    # the listing is almost certainly incomplete — skip to avoid mass deletes.
+    if not all_files and all_state:
+        logger.warning(
+            f"Diff sync: Drive listing returned 0 files but {len(all_state)} "
+            "are tracked — skipping to avoid false deletes"
+        )
+        return 0
+
     # Build map of file_id → (file_data, rel_path) for Drive listing
     drive_map: dict[str, tuple[dict, str]] = {}
     for f in all_files:
@@ -369,8 +378,10 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
 
     changes: list[Change] = []
 
+    # Use cached all_state for lookups (single Firestore read) instead
+    # of individual get_file() calls for consistency and performance.
     for file_id, (file_data, rel_path) in drive_map.items():
-        existing = state.get_file(file_id)
+        existing = all_state.get(file_id)
         last_user = file_data.get("lastModifyingUser", {})
         author_name = last_user.get("displayName")
         author_email = last_user.get("emailAddress")
@@ -438,15 +449,29 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
                 )
 
     # Detect deletes: files in Firestore but not in Drive listing
+    deletes: list[Change] = []
     for file_id, data in all_state.items():
         if file_id not in drive_map:
-            changes.append(
+            deletes.append(
                 Change(
                     file_id=file_id,
                     change_type=ChangeType.DELETE,
                     old_path=data.get("path"),
                 )
             )
+
+    # Safety threshold: refuse to delete more than half of tracked files
+    # in a single diff sync.  Mass deletes almost always indicate an
+    # incomplete Drive listing, not a genuine user action.
+    if deletes and all_state:
+        delete_ratio = len(deletes) / len(all_state)
+        if delete_ratio > 0.5 and len(deletes) > 5:
+            logger.warning(
+                f"Diff sync: would delete {len(deletes)}/{len(all_state)} tracked files "
+                f"({delete_ratio:.0%}) — skipping deletes as likely false positives"
+            )
+        else:
+            changes.extend(deletes)
 
     if not changes:
         logger.info("Diff sync: no changes detected")
