@@ -247,7 +247,7 @@ functions/          # Cloud Function source (deployed to GCP)
   └── config.py
 infra/              # Terraform (Cloud Functions, Scheduler, Firestore, IAM)
 scripts/            # setup.sh (guided onboarding), bootstrap.sh, deploy.sh, verify.sh
-tests/              # pytest suite (~190 test cases)
+tests/              # pytest + bats suite (~270 test cases)
 ```
 
 ### Dependency management

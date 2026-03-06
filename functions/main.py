@@ -133,9 +133,9 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3, *, allow_diff_s
     elif watch_info.get("expiration", 0) < time.time() * 1000:
         logger.warning("Watch channel expired")
 
+    drive = DriveClient()
     for i in range(max_iterations):
         state.clear_resync_needed()
-        drive = DriveClient()
         repo = GitRepo()
         try:
             count = run_sync(drive, state, repo)
