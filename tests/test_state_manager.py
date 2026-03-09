@@ -327,3 +327,44 @@ class TestFileTracking:
         result = sm.get_files_in_folder("Reports/")
         assert "f1" in result
         assert "f2" not in result
+
+
+# ---------------------------------------------------------------------------
+# Deferred deletes flag
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredDeletes:
+    """Tests for the deferred_deletes flag (set/has/clear)."""
+
+    def test_set_deferred_deletes(self):
+        sm, mock_db = _make_state_manager()
+        set_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        )
+
+        sm.set_deferred_deletes()
+        set_mock.assert_called_once_with({"deferred": True})
+
+    def test_has_deferred_deletes_returns_true_when_set(self):
+        sm, mock_db = _make_state_manager()
+        snap = _make_doc_snapshot({"deferred": True})
+        mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.get.return_value = snap
+
+        assert sm.has_deferred_deletes() is True
+
+    def test_has_deferred_deletes_returns_false_when_not_set(self):
+        sm, mock_db = _make_state_manager()
+        snap = _make_doc_snapshot(None, exists=False)
+        mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.get.return_value = snap
+
+        assert sm.has_deferred_deletes() is False
+
+    def test_clear_deferred_deletes(self):
+        sm, mock_db = _make_state_manager()
+        delete_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        )
+
+        sm.clear_deferred_deletes()
+        delete_mock.assert_called_once()

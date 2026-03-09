@@ -111,6 +111,19 @@ class StateManager:
         doc = self._config_ref("resync_needed").get()
         return bool(doc.exists and doc.to_dict().get("needed", False))
 
+    # --- Deferred deletes flag ---
+
+    def set_deferred_deletes(self):
+        """Flag that webhook deferred mass deletes for diff sync to handle."""
+        self._config_ref("deferred_deletes").set({"deferred": True})
+
+    def clear_deferred_deletes(self):
+        self._config_ref("deferred_deletes").delete()
+
+    def has_deferred_deletes(self) -> bool:
+        doc = self._config_ref("deferred_deletes").get()
+        return bool(doc.exists and doc.to_dict().get("deferred", False))
+
     # --- File tracking (subcollection) ---
 
     def _file_ref(self, file_id: str):

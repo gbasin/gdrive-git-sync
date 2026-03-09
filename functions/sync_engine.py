@@ -297,6 +297,25 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
         logger.info("All changes were skipped")
         return 0
 
+    # Safety guard: if deletes dominate the batch, they are likely false
+    # positives from service-account shared-folder blindness.  Drop the
+    # deletes so state + git files stay intact, and let diff sync
+    # reconcile (it can detect moves via file-ID + path comparison).
+    delete_changes = [c for c in changes if c.change_type == ChangeType.DELETE]
+    if len(delete_changes) > 5:
+        total_tracked = len(state.get_all_files())
+        if total_tracked and len(delete_changes) / total_tracked > 0.5:
+            logger.warning(
+                f"Webhook sync: {len(delete_changes)}/{total_tracked} tracked files "
+                f"marked for delete ({len(delete_changes) / total_tracked:.0%}) — "
+                "deferring deletes to diff sync"
+            )
+            changes = [c for c in changes if c.change_type != ChangeType.DELETE]
+            state.set_deferred_deletes()
+            if not changes:
+                state.set_page_token(new_token)
+                return 0
+
     logger.info(f"Processing {len(changes)} changes")
 
     # Clone repo (clone_or_init handles empty repos gracefully)
@@ -463,15 +482,20 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
     # Safety threshold: refuse to delete more than half of tracked files
     # in a single diff sync.  Mass deletes almost always indicate an
     # incomplete Drive listing, not a genuine user action.
+    # Exception: if the webhook already deferred these deletes, both paths
+    # agree the files are gone — allow the deletes through.
+    webhook_deferred = state.has_deferred_deletes()
     if deletes and all_state:
         delete_ratio = len(deletes) / len(all_state)
-        if delete_ratio > 0.5 and len(deletes) > 5:
+        if delete_ratio > 0.5 and len(deletes) > 5 and not webhook_deferred:
             logger.warning(
                 f"Diff sync: would delete {len(deletes)}/{len(all_state)} tracked files "
                 f"({delete_ratio:.0%}) — skipping deletes as likely false positives"
             )
         else:
             changes.extend(deletes)
+    if webhook_deferred:
+        state.clear_deferred_deletes()
 
     if not changes:
         logger.info("Diff sync: no changes detected")
