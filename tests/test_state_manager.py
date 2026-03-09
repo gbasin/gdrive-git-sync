@@ -328,6 +328,107 @@ class TestFileTracking:
         assert "f1" in result
         assert "f2" not in result
 
+    def test_clear_all_files(self):
+        sm, mock_db = _make_state_manager()
+
+        doc1 = MagicMock()
+        doc2 = MagicMock()
+        mock_db.collection.return_value.document.return_value.collection.return_value.stream.return_value = [
+            doc1,
+            doc2,
+        ]
+
+        sm.clear_all_files()
+        doc1.reference.delete.assert_called_once()
+        doc2.reference.delete.assert_called_once()
+
+    def test_clear_all_files_empty(self):
+        sm, mock_db = _make_state_manager()
+        mock_db.collection.return_value.document.return_value.collection.return_value.stream.return_value = []
+
+        sm.clear_all_files()
+        # No error when there are no files to delete
+
+    def test_get_file_by_target_found(self):
+        sm, mock_db = _make_state_manager()
+
+        doc = MagicMock()
+        doc.id = "shortcut1"
+        doc.to_dict.return_value = {"name": "link.gdoc", "target_id": "target123"}
+
+        query_mock = MagicMock()
+        query_mock.stream.return_value = [doc]
+        limit_mock = MagicMock()
+        limit_mock.limit.return_value = query_mock
+        where_mock = MagicMock()
+        where_mock.where.return_value = limit_mock
+        mock_db.collection.return_value.document.return_value.collection.return_value = where_mock
+
+        result = sm.get_file_by_target("target123")
+        assert result == ("shortcut1", {"name": "link.gdoc", "target_id": "target123"})
+
+    def test_get_file_by_target_not_found(self):
+        sm, mock_db = _make_state_manager()
+
+        query_mock = MagicMock()
+        query_mock.stream.return_value = iter([])
+        limit_mock = MagicMock()
+        limit_mock.limit.return_value = query_mock
+        where_mock = MagicMock()
+        where_mock.where.return_value = limit_mock
+        mock_db.collection.return_value.document.return_value.collection.return_value = where_mock
+
+        result = sm.get_file_by_target("nonexistent")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Resync flag
+# ---------------------------------------------------------------------------
+
+
+class TestResyncFlag:
+    """Tests for the resync_needed flag (set/clear/is)."""
+
+    def test_set_resync_needed(self):
+        sm, mock_db = _make_state_manager()
+        set_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.set
+        )
+
+        sm.set_resync_needed()
+        set_mock.assert_called_once_with({"needed": True})
+
+    def test_clear_resync_needed(self):
+        sm, mock_db = _make_state_manager()
+        delete_mock = (
+            mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.delete
+        )
+
+        sm.clear_resync_needed()
+        delete_mock.assert_called_once()
+
+    def test_is_resync_needed_returns_true_when_set(self):
+        sm, mock_db = _make_state_manager()
+        snap = _make_doc_snapshot({"needed": True})
+        mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.get.return_value = snap
+
+        assert sm.is_resync_needed() is True
+
+    def test_is_resync_needed_returns_false_when_not_set(self):
+        sm, mock_db = _make_state_manager()
+        snap = _make_doc_snapshot(None, exists=False)
+        mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.get.return_value = snap
+
+        assert sm.is_resync_needed() is False
+
+    def test_is_resync_needed_returns_false_when_needed_is_false(self):
+        sm, mock_db = _make_state_manager()
+        snap = _make_doc_snapshot({"needed": False})
+        mock_db.collection.return_value.document.return_value.collection.return_value.document.return_value.get.return_value = snap
+
+        assert sm.is_resync_needed() is False
+
 
 # ---------------------------------------------------------------------------
 # Deferred deletes flag

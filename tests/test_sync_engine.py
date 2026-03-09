@@ -2198,6 +2198,28 @@ class TestFolderChangeExpansion:
         assert len(result) == 1
         assert result[0].old_path == "MyFolder/doc.docx"
 
+    def test_folder_not_in_folder_cascades_delete(self):
+        """_handle_folder_change delegates to _cascade_folder_delete when folder is outside."""
+        from sync_engine import _handle_folder_change
+
+        mock_drive = MagicMock()
+        mock_drive.is_in_folder.return_value = False
+        mock_drive.list_folder_files.return_value = [{"id": "c1"}]
+
+        mock_state = MagicMock()
+        mock_state.get_file.return_value = {"path": "Folder/a.docx"}
+
+        file_data = {
+            "name": "Folder",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": ["external"],
+            "lastModifyingUser": {},
+        }
+
+        result = _handle_folder_change("folder1", file_data, mock_drive, mock_state)
+        assert len(result) == 1
+        assert result[0].change_type == "delete"
+
     def test_folder_cascade_fallback_skips_ambiguous_names(self):
         """If the same folder name appears in multiple subtrees, skip to avoid data loss."""
         from sync_engine import _cascade_folder_delete
@@ -2633,3 +2655,1355 @@ class TestDiffSyncDeferredDeletes:
         assert result == 0
         mock_state.clear_deferred_deletes.assert_not_called()
         mock_repo.push.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_docs_subdir edge cases (lines 67, 73)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDocsSubdir:
+    """Tests for _resolve_docs_subdir: explicit config, folder name, and fallback."""
+
+    def test_explicit_docs_subdir_left_alone(self):
+        """If cfg.docs_subdir is already set, do not overwrite it."""
+        from sync_engine import _resolve_docs_subdir
+
+        mock_drive = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "explicit_dir"
+
+        _resolve_docs_subdir(mock_drive, cfg)
+
+        # Should NOT call get_folder_name since docs_subdir was already set
+        mock_drive.get_folder_name.assert_not_called()
+        assert cfg.docs_subdir == "explicit_dir"
+
+    def test_no_docs_subdir_resolved_from_drive(self):
+        """If cfg.docs_subdir is empty, resolve from Drive folder name."""
+        from sync_engine import _resolve_docs_subdir
+
+        mock_drive = MagicMock()
+        mock_drive.get_folder_name.return_value = "SharedDocs"
+        cfg = MagicMock()
+        cfg.docs_subdir = ""
+        cfg.drive_folder_id = "folder123"
+
+        _resolve_docs_subdir(mock_drive, cfg)
+
+        mock_drive.get_folder_name.assert_called_once_with("folder123")
+        assert cfg.docs_subdir == "SharedDocs"
+
+    def test_no_docs_subdir_and_no_folder_name(self):
+        """If Drive folder name is None, docs_subdir stays empty (repo root)."""
+        from sync_engine import _resolve_docs_subdir
+
+        mock_drive = MagicMock()
+        mock_drive.get_folder_name.return_value = None
+        cfg = MagicMock()
+        cfg.docs_subdir = ""
+        cfg.drive_folder_id = "folder123"
+
+        _resolve_docs_subdir(mock_drive, cfg)
+
+        mock_drive.get_folder_name.assert_called_once()
+        # docs_subdir should not be changed (remains empty)
+        assert cfg.docs_subdir == ""
+
+
+# ---------------------------------------------------------------------------
+# run_diff_sync internal loop (lines 376-459)
+# ---------------------------------------------------------------------------
+
+
+class TestRunDiffSyncLoop:
+    """Tests for the diff sync main loop: ADD, MODIFY, RENAME, MOVE detection."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    def _setup_diff_sync(self, mock_drive, mock_state, drive_files, all_state):
+        """Common setup for diff sync tests."""
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_state.get_all_files.return_value = all_state
+        mock_state.has_deferred_deletes.return_value = False
+        mock_drive.get_start_page_token.return_value = "new_token"
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_new_file_as_add(self, mock_extract, mock_drive, mock_state):
+        """A file in Drive not in Firestore state is classified as ADD."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        drive_files = [
+            {
+                "id": "new1",
+                "name": "brand_new.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_new",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {}  # empty state -> file is new
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "brand_new.txt"
+        mock_drive.download_file.return_value = b"new content"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        mock_drive.download_file.assert_called_once_with("new1")
+        mock_repo.push.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_modify_by_md5(self, mock_extract, mock_drive, mock_state):
+        """A file with changed md5Checksum is classified as MODIFY."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "report.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_new",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "report.txt",
+                "path": "report.txt",
+                "md5": "md5_old",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "report.txt"
+        mock_drive.download_file.return_value = b"updated content"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        mock_drive.download_file.assert_called_once_with("f1")
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_modify_by_modified_time(self, mock_extract, mock_drive, mock_state):
+        """A Google-native file (no md5) with changed modifiedTime is MODIFY."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-06-15T12:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {"name": "My Doc", "path": "My Doc", "md5": None, "modified_time": "2025-01-01T00:00:00Z"},
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "My Doc"
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        mock_drive.export_file.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_skips_unchanged_file(self, mock_extract, mock_drive, mock_state):
+        """A file with matching md5 should NOT be treated as a change."""
+        from sync_engine import run_diff_sync
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "stable.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "stable.txt",
+                "path": "stable.txt",
+                "md5": "same_md5",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "stable.txt"
+        mock_drive.get_start_page_token.return_value = "new_token"
+
+        mock_repo = MagicMock()
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_repo.clone_or_init.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_rename(self, mock_extract, mock_drive, mock_state):
+        """A file whose name changed is classified as RENAME."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "new_name.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {"name": "old_name.txt", "path": "old_name.txt", "md5": "same_md5"},
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "new_name.txt"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+        mock_repo.rename_file.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        mock_repo.rename_file.assert_called()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_move(self, mock_extract, mock_drive, mock_state):
+        """A file with same name but different path is classified as MOVE."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "doc.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {"name": "doc.txt", "path": "OldFolder/doc.txt", "md5": "same_md5"},
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "NewFolder/doc.txt"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+        mock_repo.rename_file.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 1
+        mock_repo.rename_file.assert_called()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_detects_delete(self, mock_extract, mock_drive, mock_state):
+        """A file in state but not in Drive listing is classified as DELETE."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        # Drive listing has one file; state has two
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "keep.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_keep",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {"name": "keep.txt", "path": "keep.txt", "md5": "md5_keep"},
+            "f2": {"name": "gone.txt", "path": "gone.txt", "md5": "md5_gone"},
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "keep.txt"
+        mock_state.get_file.return_value = {"name": "gone.txt", "path": "gone.txt", "mime_type": ""}
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # 1 delete processed (keep.txt matches state so no change)
+        assert result == 1
+        mock_repo.delete_file.assert_called()
+
+    def test_diff_sync_no_files_and_no_state(self, mock_drive, mock_state):
+        """When Drive returns nothing and state is empty, returns 0."""
+        from sync_engine import run_diff_sync
+
+        mock_drive.list_all_files.return_value = []
+        mock_state.get_all_files.return_value = {}
+
+        mock_repo = MagicMock()
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_repo.clone_or_init.assert_not_called()
+
+    def test_diff_sync_empty_drive_but_has_state_skips(self, mock_drive, mock_state):
+        """When Drive returns nothing but state has files, skip to avoid false deletes."""
+        from sync_engine import run_diff_sync
+
+        mock_drive.list_all_files.return_value = []
+        mock_state.get_all_files.return_value = {"f1": {"name": "a.txt", "path": "a.txt"}}
+
+        mock_repo = MagicMock()
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_repo.clone_or_init.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_filters_excluded_files(self, mock_extract, mock_drive, mock_state):
+        """Files matching exclude patterns should be skipped."""
+        from sync_engine import run_diff_sync
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "excluded.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_1",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.get_file_path.return_value = "excluded.txt"
+        mock_drive.matches_exclude_pattern.return_value = True  # excluded
+        mock_drive.should_skip_file.return_value = None
+        mock_state.get_all_files.return_value = {}
+        mock_state.has_deferred_deletes.return_value = False
+        mock_drive.get_start_page_token.return_value = "new_token"
+
+        mock_repo = MagicMock()
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_filters_skip_files(self, mock_extract, mock_drive, mock_state):
+        """Files that should_skip_file says to skip are excluded."""
+        from sync_engine import run_diff_sync
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "huge.bin",
+                "mimeType": "application/octet-stream",
+                "md5Checksum": "md5_1",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.get_file_path.return_value = "huge.bin"
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = "file too large"
+        mock_state.get_all_files.return_value = {}
+        mock_state.has_deferred_deletes.return_value = False
+        mock_drive.get_start_page_token.return_value = "new_token"
+
+        mock_repo = MagicMock()
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_multi_author_separate_commits(self, mock_extract, mock_drive, mock_state):
+        """Diff sync with multiple authors produces separate commits."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "a.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_a",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+            {
+                "id": "f2",
+                "name": "b.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_b",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Bob", "emailAddress": "bob@co.com"},
+            },
+        ]
+        all_state = {}  # both new
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.side_effect = ["a.txt", "b.txt"]
+        mock_drive.download_file.return_value = b"content"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 2
+        # Two authors -> unstage_all + two separate commits
+        assert mock_repo.commit.call_count == 2
+        mock_repo.unstage_all.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_page_token_exception_handled(self, mock_extract, mock_drive, mock_state):
+        """If setting page token raises, diff sync still returns normally."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "new.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_new",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, {})
+        mock_drive.get_file_path.return_value = "new.txt"
+        mock_drive.download_file.return_value = b"content"
+        mock_drive.get_start_page_token.side_effect = Exception("API error")
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        # Should not raise
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+        assert result == 1
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_had_failures_logged(self, mock_extract, mock_drive, mock_state):
+        """When some changes fail, had_failures is logged but sync continues."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "bad.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_new",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+            {
+                "id": "f2",
+                "name": "good.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_good",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Bob", "emailAddress": "bob@co.com"},
+            },
+        ]
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, {})
+        mock_drive.get_file_path.side_effect = ["bad.txt", "good.txt"]
+        mock_drive.download_file.side_effect = [Exception("download failed"), b"good"]
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # Only the good file was processed
+        assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# update_file_state RENAME/MOVE path (lines 1059-1083)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateFileStateRenameMoveAndAdd:
+    """Tests for update_file_state RENAME/MOVE and ADD full-write logic."""
+
+    def test_rename_updates_path_and_name(self, mock_state):
+        """RENAME merges existing state with new path and name."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "old.docx",
+            "path": "Reports/old.docx",
+            "md5": "old_md5",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "modified_time": "2025-01-01T00:00:00Z",
+            "extracted_path": "Reports/old.docx.md",
+        }
+
+        file_data = _make_file_data(
+            name="new.docx",
+            md5="new_md5",
+            modified_time="2025-06-01T00:00:00Z",
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=file_data,
+            old_path="Reports/old.docx",
+            new_path="Reports/new.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        mock_state.set_file.assert_called_once()
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "Reports/new.docx"
+        assert stored["name"] == "new.docx"
+        assert stored["md5"] == "new_md5"
+        assert stored["modified_time"] == "2025-06-01T00:00:00Z"
+        assert stored["extracted_path"] == "Reports/new.docx.md"
+        assert stored["mime_type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    def test_move_updates_path_preserves_name(self, mock_state):
+        """MOVE updates path and recomputes extracted_path, preserves name."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "doc.docx",
+            "path": "FolderA/doc.docx",
+            "md5": "abc",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "extracted_path": "FolderA/doc.docx.md",
+        }
+
+        # MOVE keeps same name but changes path
+        file_data = _make_file_data(name="doc.docx", md5="abc")
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=file_data,
+            old_path="FolderA/doc.docx",
+            new_path="FolderB/doc.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "FolderB/doc.docx"
+        assert stored["extracted_path"] == "FolderB/doc.docx.md"
+
+    def test_rename_no_existing_state(self, mock_state):
+        """RENAME when state.get_file returns None starts from empty dict."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = None
+
+        file_data = _make_file_data(name="new.txt", mime_type="text/plain", md5="xyz")
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=file_data,
+            old_path="old.txt",
+            new_path="new.txt",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "new.txt"
+        assert stored["name"] == "new.txt"
+
+    def test_rename_updates_author_info(self, mock_state):
+        """RENAME stores lastModifyingUser from file_data."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "old.docx",
+            "path": "old.docx",
+            "last_modified_by_name": "OldAuthor",
+        }
+
+        file_data = _make_file_data(
+            name="new.docx",
+            md5="md5",
+            author_name="NewAuthor",
+            author_email="new@co.com",
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=file_data,
+            old_path="old.docx",
+            new_path="new.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["last_modified_by_name"] == "NewAuthor"
+        assert stored["last_modified_by_email"] == "new@co.com"
+
+    def test_rename_recomputes_extracted_path_google_doc(self, mock_state):
+        """RENAME of a Google Doc recomputes extracted_path correctly."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "Old Title",
+            "path": "Old Title",
+            "mime_type": "application/vnd.google-apps.document",
+            "extracted_path": "Old Title.docx.md",
+        }
+
+        file_data = _make_file_data(
+            name="New Title",
+            mime_type="application/vnd.google-apps.document",
+            md5=None,
+            modified_time="2025-06-01T00:00:00Z",
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=file_data,
+            old_path="Old Title",
+            new_path="New Title",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "New Title"
+        assert stored["extracted_path"] == "New Title.docx.md"
+        assert stored["mime_type"] == "application/vnd.google-apps.document"
+
+    def test_add_with_subfolder_stores_extracted_path(self, mock_state):
+        """ADD in a subfolder computes extracted_path with directory."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        file_data = _make_file_data(
+            name="report.docx",
+            md5="abc123",
+            modified_time="2025-06-01T00:00:00Z",
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="2025/Q1/report.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "2025/Q1/report.docx"
+        assert stored["extracted_path"] == "2025/Q1/report.docx.md"
+
+    def test_modify_full_write_updates_all_fields(self, mock_state):
+        """MODIFY uses the ADD/MODIFY full-write logic with all fields."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        file_data = _make_file_data(
+            name="file.docx",
+            md5="new_md5",
+            modified_time="2025-06-15T12:00:00Z",
+            author_name="Bob",
+            author_email="bob@co.com",
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MODIFY,
+            file_data=file_data,
+            new_path="Reports/file.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["name"] == "file.docx"
+        assert stored["path"] == "Reports/file.docx"
+        assert stored["md5"] == "new_md5"
+        assert stored["modified_time"] == "2025-06-15T12:00:00Z"
+        assert stored["extracted_path"] == "Reports/file.docx.md"
+        assert stored["last_modified_by_name"] == "Bob"
+        assert stored["last_modified_by_email"] == "bob@co.com"
+
+
+# ---------------------------------------------------------------------------
+# _handle_rename edge cases (lines 841, 848-853)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleRenameEdgeCases:
+    """Tests for _handle_rename edge cases: missing paths, no file_data, moved_ok=False."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("re-extracted content")
+        return True
+
+    def test_missing_old_path_returns_early(self, mock_state):
+        """_handle_rename with no old_path does nothing."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(),
+            old_path=None,
+            new_path="new.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        mock_repo.rename_file.assert_not_called()
+        mock_drive.download_file.assert_not_called()
+
+    def test_missing_new_path_returns_early(self, mock_state):
+        """_handle_rename with no new_path does nothing."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(),
+            old_path="old.docx",
+            new_path=None,
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        mock_repo.rename_file.assert_not_called()
+
+    def test_no_file_data_uses_existing_state(self, mock_state):
+        """When file_data is None, _handle_rename falls back to existing state."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_state.get_file.return_value = {
+            "name": "doc.txt",
+            "path": "old/doc.txt",
+            "mime_type": "text/plain",
+        }
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.rename_file.return_value = True
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=None,  # synthetic move from folder expansion
+            old_path="old/doc.txt",
+            new_path="new/doc.txt",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        # Should rename using existing state info
+        mock_repo.rename_file.assert_called_once_with("docs/old/doc.txt", "docs/new/doc.txt")
+        # No download since file_data is None
+        mock_drive.download_file.assert_not_called()
+
+    def test_no_file_data_no_existing_state_uses_basename(self, mock_state):
+        """When file_data is None and no state, falls back to basename."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_state.get_file.return_value = None
+        mock_drive = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.rename_file.return_value = True
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=None,
+            old_path="old/report.txt",
+            new_path="new/renamed.txt",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        mock_repo.rename_file.assert_called_once_with("docs/old/report.txt", "docs/new/renamed.txt")
+
+    @patch("sync_engine.extract_text")
+    def test_move_failed_re_downloads(self, mock_extract, mock_state):
+        """When rename_file returns False (source missing), re-download to new path."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_file.return_value = {
+            "name": "doc.docx",
+            "path": "old/doc.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "md5": "same_md5",
+        }
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"re-downloaded content"
+
+        mock_repo = MagicMock()
+        mock_repo.rename_file.return_value = False  # source file missing
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=_make_file_data(name="doc.docx", md5="same_md5"),
+            old_path="old/doc.docx",
+            new_path="new/doc.docx",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        # Since move failed, re-download should happen
+        mock_drive.download_file.assert_called_once_with("f1")
+        mock_repo.write_file.assert_called()
+
+    @patch("sync_engine.extract_text")
+    def test_rename_same_md5_no_existing_state_re_downloads(self, mock_extract, mock_state):
+        """When existing state is None and moved_ok is True, need_download stays False initially
+        but without existing state, no md5 comparison happens so no re-download."""
+        from sync_engine import Change, ChangeType, _handle_rename
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        mock_state.get_file.return_value = None  # no existing state
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"content"
+
+        mock_repo = MagicMock()
+        mock_repo.rename_file.return_value = True  # move succeeded
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new.txt", mime_type="text/plain", md5="md5"),
+            old_path="old.txt",
+            new_path="new.txt",
+        )
+
+        _handle_rename(change, mock_drive, mock_repo, mock_state, "docs")
+
+        # moved_ok=True, no existing state -> need_download=False, no re-download
+        mock_drive.download_file.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# classify_change shortcut resolution edge cases (lines 517-536, 598-599)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyChangeShortcutEdgeCases:
+    """Tests for shortcut name fallback from path in classify_change."""
+
+    def test_shortcut_target_with_name_in_state(self, mock_drive, mock_state):
+        """When shortcut state has a name, it is used in the merged file_data."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Reports/link.docx", "name": "link.docx"},
+        )
+
+        target_file_data = _make_file_data(name="target_original.docx", md5="new_md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.MODIFY
+        assert result.file_data["name"] == "link.docx"
+
+    def test_shortcut_target_no_name_uses_path_basename(self, mock_drive, mock_state):
+        """When shortcut state has no name but has a path, basename is used."""
+        from sync_engine import classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Reports/from_path.docx", "name": ""},
+        )
+
+        target_file_data = _make_file_data(name="target_original.docx", md5="new_md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.file_data["name"] == "from_path.docx"
+
+    def test_shortcut_target_no_name_no_path(self, mock_drive, mock_state):
+        """When shortcut state has neither name nor path, name is not overridden."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "", "name": ""},
+        )
+
+        target_file_data = _make_file_data(name="target_original.docx", md5="new_md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.change_type == ChangeType.MODIFY
+        # Empty shortcut_name means the name from target stays
+        assert result.file_data["name"] == "target_original.docx"
+
+    def test_shortcut_target_name_none_uses_path(self, mock_drive, mock_state):
+        """When shortcut state has name=None, falls back to path basename."""
+        from sync_engine import classify_change
+
+        mock_state.get_file.return_value = None
+        mock_drive.is_in_folder.return_value = False
+        mock_state.get_file_by_target.return_value = (
+            "shortcut1",
+            {"path": "Docs/shortcut_link.docx"},  # no "name" key at all
+        )
+
+        target_file_data = _make_file_data(name="target.docx", md5="md5")
+        raw = {"file": target_file_data}
+
+        result = classify_change("target1", raw, mock_drive, mock_state)
+
+        assert result is not None
+        assert result.file_data["name"] == "shortcut_link.docx"
+        assert result.file_data["_target_id"] == "target1"
+
+    def test_classify_change_shortcut_resolved_to_skip(self, mock_drive, mock_state):
+        """A resolved shortcut pointing to a file with same md5 is SKIP."""
+        from sync_engine import ChangeType, classify_change
+
+        mock_state.get_file.return_value = {
+            "name": "link.docx",
+            "path": "Reports/link.docx",
+            "md5": "same_md5",
+        }
+        mock_drive.resolve_shortcut.return_value = {
+            "id": "shortcut1",
+            "name": "link.docx",
+            "parents": ["folder123"],
+            "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "md5Checksum": "same_md5",
+            "modifiedTime": "2025-01-01T00:00:00Z",
+            "_target_id": "target1",
+            "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+        }
+        mock_drive.get_file_path.return_value = "Reports/link.docx"
+
+        raw = {"file": _make_shortcut_data()}
+
+        result = classify_change("shortcut1", raw, mock_drive, mock_state)
+        assert result.change_type == ChangeType.SKIP
+
+
+# ---------------------------------------------------------------------------
+# run_sync dedup: classify_change returning list (lines 279, 281, 289-290)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSyncListClassifyAndDedup:
+    """Tests for run_sync handling of classify_change returning a list and dedup logic."""
+
+    @patch("sync_engine.extract_text")
+    def test_classify_returning_list_extends_changes(self, mock_extract, mock_drive, mock_state):
+        """When classify_change returns a list (folder expansion), all non-SKIP changes
+        are included and the dedup logic prefers direct over synthetic."""
+        from sync_engine import run_sync
+
+        mock_extract.return_value = False
+
+        mock_state.get_page_token.return_value = "token_1"
+
+        # A folder change that expands to child moves
+        folder_data = {
+            "name": "Renamed",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": ["folder123"],
+            "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+        }
+
+        # Also a direct file change for one of the children (with file_data)
+        child_file_data = _make_file_data(name="child.txt", mime_type="text/plain", md5="new_md5")
+
+        mock_drive.list_changes.return_value = (
+            [
+                {"fileId": "folder1", "file": folder_data},
+                {"fileId": "child1", "file": child_file_data},
+            ],
+            "token_2",
+        )
+
+        # classify_change: folder returns list of moves, child returns MODIFY
+        def fake_classify(file_id, raw, drive, state):
+            from sync_engine import Change, ChangeType
+
+            if file_id == "folder1":
+                return [
+                    Change(
+                        file_id="child1",
+                        change_type=ChangeType.MOVE,
+                        file_data=None,  # synthetic
+                        old_path="Old/child.txt",
+                        new_path="Renamed/child.txt",
+                        author_name="Alice",
+                        author_email="alice@co.com",
+                    ),
+                ]
+            # child1: direct MODIFY
+            return Change(
+                file_id="child1",
+                change_type=ChangeType.MODIFY,
+                file_data=child_file_data,
+                new_path="Renamed/child.txt",
+                author_name="Alice",
+                author_email="alice@co.com",
+            )
+
+        mock_drive.download_file.return_value = b"content"
+        mock_drive.get_file_path.return_value = "Renamed/child.txt"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        with patch("sync_engine.classify_change", side_effect=fake_classify):
+            result = run_sync(mock_drive, mock_state, mock_repo)
+
+        # Dedup: direct MODIFY (with file_data) wins over synthetic MOVE (no file_data)
+        assert result == 1
+        mock_repo.commit.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_classify_returning_none_is_skipped(self, mock_extract, mock_drive, mock_state):
+        """When classify_change returns None for some changes, they are dropped."""
+        from sync_engine import run_sync
+
+        mock_extract.return_value = False
+
+        mock_state.get_page_token.return_value = "token_1"
+        # First file is unknown and outside our folder -> None
+        # Second file is new -> ADD
+        mock_state.get_file.return_value = None
+        mock_state.get_file_by_target.return_value = None
+
+        unknown_file = _make_file_data(name="unknown.txt", mime_type="text/plain", md5="u1")
+        good_file = _make_file_data(name="good.txt", mime_type="text/plain", md5="g1")
+
+        mock_drive.list_changes.return_value = (
+            [
+                {"fileId": "f_unknown", "file": unknown_file},
+                {"fileId": "f_good", "file": good_file},
+            ],
+            "token_2",
+        )
+        # First file is outside folder -> classify returns None
+        mock_drive.is_in_folder.side_effect = [False, True]
+        mock_drive.get_file_path.return_value = "good.txt"
+        mock_drive.download_file.return_value = b"content"
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        # Only the good file was processed
+        assert result == 1
+        mock_state.set_page_token.assert_called_with("token_2")
+
+    def test_dedup_synthetic_not_replaced_by_another_synthetic(self):
+        """Two synthetic changes (both file_data=None) — first one wins."""
+        from sync_engine import Change, ChangeType
+
+        first = Change(file_id="f1", change_type=ChangeType.MOVE, file_data=None, old_path="a", new_path="b")
+        second = Change(file_id="f1", change_type=ChangeType.DELETE, file_data=None, old_path="a")
+
+        changes = [first, second]
+        seen: dict[str, Change] = {}
+        for c in changes:
+            if c.file_id in seen:
+                if c.file_data is not None:
+                    seen[c.file_id] = c
+            else:
+                seen[c.file_id] = c
+        deduped = list(seen.values())
+
+        assert len(deduped) == 1
+        # First synthetic wins (DELETE doesn't replace MOVE since both have file_data=None)
+        assert deduped[0].change_type == ChangeType.MOVE
+
+
+# ---------------------------------------------------------------------------
+# _stage_change_files edge cases (line 1002, 1046-1047)
+# ---------------------------------------------------------------------------
+
+
+class TestStageChangeFilesAdditional:
+    """Additional edge cases for _stage_change_files."""
+
+    def test_delete_no_old_path_returns_early(self):
+        """DELETE with no old_path does nothing."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(file_id="f1", change_type=ChangeType.DELETE, old_path=None)
+
+        _stage_change_files(change, mock_repo, "docs")
+
+        mock_repo.stage_file.assert_not_called()
+
+    def test_add_no_file_data_stages_new_path(self):
+        """ADD with new_path but no file_data stages the raw path."""
+        from sync_engine import Change, ChangeType, _stage_change_files
+
+        mock_repo = MagicMock()
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            new_path="Reports/doc.txt",
+            file_data=None,
+        )
+
+        _stage_change_files(change, mock_repo, "docs")
+
+        mock_repo.stage_file.assert_called_once_with("docs/Reports/doc.txt")
+
+
+# ---------------------------------------------------------------------------
+# _download_and_extract: 403 fileNotDownloadable fallback (lines 924-939)
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadAndExtractFallback:
+    """Tests for the download fallback when Drive returns 403 fileNotDownloadable."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    @staticmethod
+    def _make_http_error(status_code, error_details=None):
+        """Build a mock HttpError with the given status_code and error_details."""
+        from unittest.mock import PropertyMock
+
+        exc = MagicMock()
+        exc.__class__ = type("HttpError", (Exception,), {})
+        type(exc).status_code = PropertyMock(return_value=status_code)
+        type(exc).error_details = PropertyMock(return_value=error_details or [])
+        # Make it behave like an exception for isinstance checks
+        return exc
+
+    @patch("sync_engine.extract_text")
+    @patch("sync_engine._is_not_downloadable")
+    def test_fallback_to_export_on_403(self, mock_is_not_dl, mock_extract):
+        """When download_file raises 403 fileNotDownloadable and actual mimeType
+        is a Google-native type, re-download as export."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+        mock_is_not_dl.return_value = True
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = Exception("403 fileNotDownloadable")
+        mock_drive.get_file_mime.return_value = "application/vnd.google-apps.document"
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+
+        # File appears as binary in metadata but is actually a Google Doc
+        file_data = _make_file_data(
+            name="tricky_doc",
+            mime_type="application/octet-stream",
+            md5=None,
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="tricky_doc",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        # download_file was tried first
+        mock_drive.download_file.assert_called_once_with("f1")
+        # Then export_file was used as fallback
+        mock_drive.export_file.assert_called_once_with(
+            "f1",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        # The exported file was written with the .docx extension
+        mock_repo.write_file.assert_any_call("docs/tricky_doc.docx", b"exported docx bytes")
+        # file_data mimeType was updated
+        assert file_data["mimeType"] == "application/vnd.google-apps.document"
+
+    @patch("sync_engine.extract_text")
+    @patch("sync_engine._is_not_downloadable")
+    def test_fallback_reraises_when_actual_mime_not_native(self, mock_is_not_dl, mock_extract):
+        """When download fails and actual mimeType is not a native export type, re-raise."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_is_not_dl.return_value = True
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = Exception("403 fileNotDownloadable")
+        mock_drive.get_file_mime.return_value = "application/pdf"  # not a native type
+
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(
+            name="file.bin",
+            mime_type="application/octet-stream",
+            md5=None,
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="file.bin",
+        )
+
+        with pytest.raises(Exception, match="403"):
+            _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+    @patch("sync_engine.extract_text")
+    @patch("sync_engine._is_not_downloadable")
+    def test_fallback_reraises_when_actual_mime_is_none(self, mock_is_not_dl, mock_extract):
+        """When download fails and get_file_mime returns None, re-raise."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_is_not_dl.return_value = True
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = Exception("403 fileNotDownloadable")
+        mock_drive.get_file_mime.return_value = None
+
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(name="file.bin", mime_type="application/octet-stream", md5=None)
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="file.bin",
+        )
+
+        with pytest.raises(Exception, match="403"):
+            _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+    @patch("sync_engine.extract_text")
+    @patch("sync_engine._is_not_downloadable")
+    def test_non_403_error_reraises(self, mock_is_not_dl, mock_extract):
+        """When download fails with a non-403 error, re-raise immediately."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_is_not_dl.return_value = False  # not a 403
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = RuntimeError("network error")
+
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(name="file.docx", md5="abc")
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="file.docx",
+        )
+
+        with pytest.raises(RuntimeError, match="network error"):
+            _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_drive.get_file_mime.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    @patch("sync_engine._is_not_downloadable")
+    def test_fallback_in_subfolder_computes_correct_path(self, mock_is_not_dl, mock_extract):
+        """When fallback export happens for a file in a subfolder, path is computed correctly."""
+        from sync_engine import Change, ChangeType, _download_and_extract
+
+        mock_extract.side_effect = self._fake_extract_ok
+        mock_is_not_dl.return_value = True
+
+        mock_drive = MagicMock()
+        mock_drive.download_file.side_effect = Exception("403 fileNotDownloadable")
+        mock_drive.get_file_mime.return_value = "application/vnd.google-apps.spreadsheet"
+        mock_drive.export_file.return_value = b"csv data"
+
+        mock_repo = MagicMock()
+
+        file_data = _make_file_data(
+            name="Budget",
+            mime_type="application/octet-stream",
+            md5=None,
+        )
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.ADD,
+            file_data=file_data,
+            new_path="Finance/Budget",
+        )
+
+        _download_and_extract(change, mock_drive, mock_repo, "docs")
+
+        mock_drive.export_file.assert_called_once_with("f1", "text/csv")
+        mock_repo.write_file.assert_any_call("docs/Finance/Budget.csv", b"csv data")
