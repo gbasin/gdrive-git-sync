@@ -982,9 +982,9 @@ def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str, state: 
         )
         mime_type = existing.get("mime_type", "") if existing else ""
         original, extracted = _git_paths(change.old_path, name, mime_type)
-        repo.stage_file(os.path.join(docs_subdir, original))
+        repo.stage_file(os.path.join(docs_subdir, original), ignore_missing=True)
         if extracted:
-            repo.stage_file(os.path.join(docs_subdir, extracted))
+            repo.stage_file(os.path.join(docs_subdir, extracted), ignore_missing=True)
 
     elif change.change_type in (ChangeType.RENAME, ChangeType.MOVE):
         existing = state.get_file(change.file_id) if state else None
@@ -999,9 +999,9 @@ def _stage_change_files(change: Change, repo: GitRepo, docs_subdir: str, state: 
         )
         if change.old_path:
             old_orig, old_ext = _git_paths(change.old_path, old_name, mime_type)
-            repo.stage_file(os.path.join(docs_subdir, old_orig))
+            repo.stage_file(os.path.join(docs_subdir, old_orig), ignore_missing=True)
             if old_ext:
-                repo.stage_file(os.path.join(docs_subdir, old_ext))
+                repo.stage_file(os.path.join(docs_subdir, old_ext), ignore_missing=True)
         if change.new_path:
             new_orig, new_ext = _git_paths(change.new_path, new_name, mime_type)
             repo.stage_file(os.path.join(docs_subdir, new_orig))

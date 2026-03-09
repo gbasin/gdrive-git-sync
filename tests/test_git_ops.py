@@ -333,3 +333,36 @@ class TestRedactArgs:
             git_repo.stage_file("deleted.txt")
             args = mock_run.call_args[0][0]
             assert args == ["git", "add", "-A", "--", "deleted.txt"]
+
+    def test_stage_file_ignore_missing_suppresses_pathspec_error(self, git_repo):
+        """ignore_missing=True suppresses 'pathspec did not match' errors."""
+        with patch("git_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128,
+                stdout="",
+                stderr="fatal: pathspec 'x.txt' did not match any files",
+            )
+            # Should not raise
+            git_repo.stage_file("x.txt", ignore_missing=True)
+
+    def test_stage_file_ignore_missing_reraises_other_errors(self, git_repo):
+        """ignore_missing=True still raises non-pathspec errors (e.g. lock)."""
+        with patch("git_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128,
+                stdout="",
+                stderr="fatal: Unable to create '.git/index.lock'",
+            )
+            with pytest.raises(subprocess.CalledProcessError):
+                git_repo.stage_file("x.txt", ignore_missing=True)
+
+    def test_stage_file_raises_when_ignore_missing_false(self, git_repo):
+        """Default ignore_missing=False raises on any git add failure."""
+        with patch("git_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128,
+                stdout="",
+                stderr="fatal: pathspec 'x.txt' did not match any files",
+            )
+            with pytest.raises(subprocess.CalledProcessError):
+                git_repo.stage_file("x.txt")

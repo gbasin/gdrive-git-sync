@@ -164,14 +164,24 @@ class GitRepo:
         if os.path.exists(full_path):
             self._run(["git", "rm", "-f", "--", rel_path])
 
-    def stage_file(self, rel_path: str):
+    def stage_file(self, rel_path: str, ignore_missing: bool = False):
         """Stage a specific file (git add).
 
         Works for added, modified, AND deleted files — the ``--``
         separator ensures paths that look like flags are handled
         correctly and ``-A`` covers deletions from the working tree.
+
+        If *ignore_missing* is True, silently skip paths that don't
+        exist in the working tree or index (common for old paths during
+        renames/deletes in partial clones).
         """
-        self._run(["git", "add", "-A", "--", rel_path])
+        try:
+            self._run(["git", "add", "-A", "--", rel_path], log_errors=not ignore_missing)
+        except subprocess.CalledProcessError as e:
+            if ignore_missing and "did not match any files" in (e.stderr or ""):
+                logger.info("Skipped staging (not in tree): %s", rel_path)
+            else:
+                raise
 
     def unstage_all(self):
         """Unstage all staged changes (git reset HEAD)."""
