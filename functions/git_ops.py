@@ -153,7 +153,9 @@ class GitRepo:
         new_full = os.path.join(self.repo_path, new_path)
         os.makedirs(os.path.dirname(new_full), exist_ok=True)
         if os.path.exists(old_full):
-            self._run(["git", "mv", "--", old_path, new_path])
+            # Use -f to allow overwriting when destination already exists
+            # (e.g. user moves a file to replace an existing one in Drive)
+            self._run(["git", "mv", "-f", "--", old_path, new_path])
             return True
         logger.warning(f"rename_file: source not found: {old_path}")
         return False

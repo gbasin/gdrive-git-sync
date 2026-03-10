@@ -163,7 +163,7 @@ class TestRenameFile:
         git_repo.rename_file("old/file.txt", "new/file.txt")
 
         args = mock_run.call_args[0][0]
-        assert args == ["git", "mv", "--", "old/file.txt", "new/file.txt"]
+        assert args == ["git", "mv", "-f", "--", "old/file.txt", "new/file.txt"]
 
     @patch("git_ops.subprocess.run")
     def test_rename_skips_missing_source(self, mock_run, git_repo):
