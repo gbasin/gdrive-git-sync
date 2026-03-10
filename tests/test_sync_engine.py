@@ -472,6 +472,7 @@ class TestUpdateFileState:
             change_type=ChangeType.ADD,
             file_data=file_data,
             new_path="Reports/report.docx",
+            extracted_path_present=True,
         )
         update_file_state(change, mock_state)
 
@@ -529,6 +530,7 @@ class TestUpdateFileState:
             change_type=ChangeType.ADD,
             file_data=file_data,
             new_path="My Doc",
+            extracted_path_present=True,
         )
         update_file_state(change, mock_state)
 
@@ -548,11 +550,28 @@ class TestUpdateFileState:
             change_type=ChangeType.ADD,
             file_data=file_data,
             new_path="data.csv",
+            extracted_path_present=True,
         )
         update_file_state(change, mock_state)
 
         stored = mock_state.set_file.call_args[0][1]
         assert stored["extracted_path"] == "data.csv.txt"
+
+    def test_modify_clears_extracted_path_when_extraction_failed(self, mock_state):
+        from sync_engine import Change, ChangeType, update_file_state
+
+        file_data = _make_file_data(md5="new_md5")
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MODIFY,
+            file_data=file_data,
+            new_path="Reports/file.docx",
+            extracted_path_present=False,
+        )
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["extracted_path"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1214,37 @@ class TestProcessChanges:
         assert len(result) == 1
         assert result[0].file_id == "f1"
         assert not had_failures
+
+    def test_modify_docx_extract_failure_deletes_stale_sidecar(self, mock_state):
+        from sync_engine import Change, ChangeType, process_changes
+
+        mock_state.get_file.return_value = {
+            "name": "file.docx",
+            "path": "Reports/file.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "extracted_path": "Reports/file.docx.md",
+        }
+        mock_drive = MagicMock()
+        mock_drive.download_file.return_value = b"updated docx bytes"
+        mock_repo = MagicMock()
+        cfg = MagicMock()
+        cfg.docs_subdir = "docs"
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MODIFY,
+            file_data=_make_file_data(name="file.docx", md5="new_md5"),
+            new_path="Reports/file.docx",
+        )
+
+        with patch("sync_engine.extract_text") as mock_extract:
+            mock_extract.return_value = False
+            result, had_failures = process_changes([change], mock_drive, mock_repo, mock_state, cfg)
+
+        assert len(result) == 1
+        assert not had_failures
+        assert change.extracted_path_present is False
+        mock_repo.delete_file.assert_called_once_with("docs/Reports/file.docx.md")
 
     def test_processes_delete_change(self, mock_state):
         from sync_engine import Change, ChangeType, process_changes
@@ -3189,6 +3239,7 @@ class TestUpdateFileStateRenameMoveAndAdd:
             file_data=file_data,
             old_path="Reports/old.docx",
             new_path="Reports/new.docx",
+            extracted_path_present=True,
         )
 
         update_file_state(change, mock_state)
@@ -3229,6 +3280,58 @@ class TestUpdateFileStateRenameMoveAndAdd:
         stored = mock_state.set_file.call_args[0][1]
         assert stored["path"] == "FolderB/doc.docx"
         assert stored["extracted_path"] == "FolderB/doc.docx.md"
+
+    def test_move_preserves_missing_extracted_path(self, mock_state):
+        """MOVE keeps extracted_path empty when no sidecar existed."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "doc.docx",
+            "path": "FolderA/doc.docx",
+            "md5": "abc",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "extracted_path": None,
+        }
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.MOVE,
+            file_data=_make_file_data(name="doc.docx", md5="abc"),
+            old_path="FolderA/doc.docx",
+            new_path="FolderB/doc.docx",
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["extracted_path"] is None
+
+    def test_rename_clears_extracted_path_when_reextract_failed(self, mock_state):
+        """RENAME clears extracted_path when re-download produced no sidecar."""
+        from sync_engine import Change, ChangeType, update_file_state
+
+        mock_state.get_file.return_value = {
+            "name": "old.docx",
+            "path": "FolderA/old.docx",
+            "md5": "old_md5",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "extracted_path": "FolderA/old.docx.md",
+        }
+
+        change = Change(
+            file_id="f1",
+            change_type=ChangeType.RENAME,
+            file_data=_make_file_data(name="new.docx", md5="new_md5"),
+            old_path="FolderA/old.docx",
+            new_path="FolderB/new.docx",
+            extracted_path_present=False,
+        )
+
+        update_file_state(change, mock_state)
+
+        stored = mock_state.set_file.call_args[0][1]
+        assert stored["path"] == "FolderB/new.docx"
+        assert stored["extracted_path"] is None
 
     def test_rename_no_existing_state(self, mock_state):
         """RENAME when state.get_file returns None starts from empty dict."""
@@ -3304,6 +3407,7 @@ class TestUpdateFileStateRenameMoveAndAdd:
             file_data=file_data,
             old_path="Old Title",
             new_path="New Title",
+            extracted_path_present=True,
         )
 
         update_file_state(change, mock_state)
@@ -3327,6 +3431,7 @@ class TestUpdateFileStateRenameMoveAndAdd:
             change_type=ChangeType.ADD,
             file_data=file_data,
             new_path="2025/Q1/report.docx",
+            extracted_path_present=True,
         )
 
         update_file_state(change, mock_state)
@@ -3351,6 +3456,7 @@ class TestUpdateFileStateRenameMoveAndAdd:
             change_type=ChangeType.MODIFY,
             file_data=file_data,
             new_path="Reports/file.docx",
+            extracted_path_present=True,
         )
 
         update_file_state(change, mock_state)
@@ -4061,7 +4167,7 @@ class TestDiffSyncGitReconciliation:
         # Should clone and re-download the missing file
         mock_repo.clone_or_init.assert_called_once()
         mock_drive.download_file.assert_called_once_with("f1")
-        assert result >= 1
+        assert result == 1
 
     @patch("sync_engine.extract_text")
     def test_unchanged_file_present_in_git_is_not_redownloaded(self, mock_extract, mock_drive, mock_state):
@@ -4145,7 +4251,7 @@ class TestDiffSyncGitReconciliation:
 
         mock_repo.clone_or_init.assert_called_once()
         mock_drive.download_file.assert_called_once_with("f1")
-        assert result >= 1
+        assert result == 1
 
     @patch("sync_engine.extract_text")
     def test_unchanged_google_native_file_missing_from_git(self, mock_extract, mock_drive, mock_state):
@@ -4169,6 +4275,7 @@ class TestDiffSyncGitReconciliation:
                 "path": "My Doc",
                 "md5": None,
                 "modified_time": "2025-01-01T00:00:00Z",
+                "extracted_path": "My Doc.docx.md",
             },
         }
 
@@ -4185,7 +4292,90 @@ class TestDiffSyncGitReconciliation:
 
         mock_repo.clone_or_init.assert_called_once()
         mock_drive.export_file.assert_called_once()
-        assert result >= 1
+        assert result == 1
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_google_native_file_missing_extracted_sidecar_is_redownloaded(
+        self, mock_extract, mock_drive, mock_state
+    ):
+        """A missing extracted sidecar should trigger reconciliation re-download."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "My Doc",
+                "path": "My Doc",
+                "md5": None,
+                "modified_time": "2025-01-01T00:00:00Z",
+                "extracted_path": "My Doc.docx.md",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "My Doc"
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+        # Git has the exported .docx but is missing the extracted .docx.md sidecar.
+        mock_repo.list_tracked_files.return_value = ["MyDrive/My Doc.docx"]
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        mock_repo.clone_or_init.assert_called_once()
+        mock_drive.export_file.assert_called_once()
+        assert result == 1
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_google_native_missing_sidecar_not_required_when_state_says_absent(
+        self, mock_extract, mock_drive, mock_state
+    ):
+        """Files without an extracted_path in state should not be re-downloaded."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "My Doc",
+                "path": "My Doc",
+                "md5": None,
+                "modified_time": "2025-01-01T00:00:00Z",
+                "extracted_path": None,
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "My Doc"
+
+        mock_repo = MagicMock()
+        mock_repo.list_tracked_files.return_value = ["MyDrive/My Doc.docx"]
+        mock_repo.has_staged_changes.return_value = False
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        mock_drive.export_file.assert_not_called()
+        assert result == 0
 
     @patch("sync_engine.extract_text")
     def test_unchanged_file_missing_from_git_with_other_changes(self, mock_extract, mock_drive, mock_state):
@@ -4295,7 +4485,7 @@ class TestInitialSyncGitReconciliation:
 
         # File should be re-downloaded even though Firestore says it's tracked
         mock_drive.download_file.assert_called_once_with("f1")
-        assert result["count"] >= 1
+        assert result["count"] == 1
 
     @patch("sync_engine.extract_text")
     def test_idempotency_skipped_file_present_in_git_not_redownloaded(self, mock_extract, mock_drive, mock_state):
@@ -4337,4 +4527,90 @@ class TestInitialSyncGitReconciliation:
 
         # Should NOT re-download
         mock_drive.download_file.assert_not_called()
+        assert result["count"] == 0
+
+    @patch("sync_engine.extract_text")
+    def test_idempotency_skipped_google_native_missing_extracted_sidecar_is_redownloaded(
+        self, mock_extract, mock_drive, mock_state
+    ):
+        """Initial sync should heal missing extracted sidecars for unchanged Google Docs."""
+        from sync_engine import run_initial_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+        mock_drive.get_folder_name.return_value = "MyDrive"
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_file_path.return_value = "My Doc"
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_state.get_file.return_value = {
+            "name": "My Doc",
+            "path": "My Doc",
+            "md5": None,
+            "modified_time": "2025-01-01T00:00:00Z",
+            "extracted_path": "My Doc.docx.md",
+        }
+
+        mock_repo = MagicMock()
+        # Git has the exported .docx but is missing the extracted .docx.md sidecar.
+        mock_repo.list_tracked_files.return_value = ["MyDrive/My Doc.docx"]
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_initial_sync(mock_drive, mock_state, mock_repo)
+
+        mock_drive.export_file.assert_called_once_with(
+            "f1", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        assert result["count"] == 1
+
+    @patch("sync_engine.extract_text")
+    def test_idempotency_skipped_google_native_missing_sidecar_not_required_when_state_says_absent(
+        self, mock_extract, mock_drive, mock_state
+    ):
+        """Initial sync should not loop on files whose sidecar was never created."""
+        from sync_engine import run_initial_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+        mock_drive.get_folder_name.return_value = "MyDrive"
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_file_path.return_value = "My Doc"
+
+        mock_state.get_file.return_value = {
+            "name": "My Doc",
+            "path": "My Doc",
+            "md5": None,
+            "modified_time": "2025-01-01T00:00:00Z",
+            "extracted_path": None,
+        }
+
+        mock_repo = MagicMock()
+        mock_repo.list_tracked_files.return_value = ["MyDrive/My Doc.docx"]
+        mock_repo.has_staged_changes.return_value = False
+
+        result = run_initial_sync(mock_drive, mock_state, mock_repo)
+
+        mock_drive.export_file.assert_not_called()
         assert result["count"] == 0

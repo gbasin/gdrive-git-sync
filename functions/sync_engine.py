@@ -33,6 +33,42 @@ def _git_paths(logical_path: str, name: str, mime_type: str) -> tuple[str, str |
     return original, extracted
 
 
+def _full_git_paths(
+    logical_path: str, name: str, mime_type: str, docs_subdir: str, *, include_extracted: bool = True
+) -> list[str]:
+    """Return git-tracked paths for a Drive file."""
+    original, extracted = _git_paths(logical_path, name, mime_type)
+    paths = [original]
+    if include_extracted and extracted:
+        paths.append(extracted)
+    if docs_subdir:
+        return [os.path.join(docs_subdir, path) for path in paths]
+    return paths
+
+
+def _missing_git_paths(
+    tracked_set: set[str],
+    logical_path: str,
+    name: str,
+    mime_type: str,
+    docs_subdir: str,
+    *,
+    include_extracted: bool = True,
+) -> list[str]:
+    """Return required git paths that are missing from the tracked set."""
+    return [
+        path
+        for path in _full_git_paths(
+            logical_path,
+            name,
+            mime_type,
+            docs_subdir,
+            include_extracted=include_extracted,
+        )
+        if path not in tracked_set
+    ]
+
+
 class ChangeType:
     ADD = "add"
     MODIFY = "modify"
@@ -51,6 +87,7 @@ class Change:
     new_path: str | None = None
     author_name: str | None = None
     author_email: str | None = None
+    extracted_path_present: bool | None = None
 
 
 @dataclass
@@ -116,7 +153,7 @@ def run_initial_sync(
     changes: list[Change] = []
     already_tracked = 0
     # Track idempotency-skipped files for git verification
-    skipped_files: list[tuple[str, dict, str, str]] = []  # (file_id, file_data, rel_path, full_original)
+    skipped_files: list[tuple[str, dict, str, bool]] = []  # (file_id, file_data, rel_path, expects_extracted)
     for file_data in all_files:
         file_id = file_data["id"]
 
@@ -135,12 +172,7 @@ def run_initial_sync(
         # Track expected git paths for orphan cleanup
         name = file_data.get("name", "")
         mime_type = file_data.get("mimeType", "")
-        original, extracted = _git_paths(rel_path, name, mime_type)
-        full_original = os.path.join(cfg.docs_subdir, original) if cfg.docs_subdir else original
-        expected_git_paths.add(full_original)
-        if extracted:
-            full_extracted = os.path.join(cfg.docs_subdir, extracted) if cfg.docs_subdir else extracted
-            expected_git_paths.add(full_extracted)
+        expected_git_paths.update(_full_git_paths(rel_path, name, mime_type, cfg.docs_subdir))
 
         # Idempotency: check if already tracked with same content
         existing = state.get_file(file_id)
@@ -149,13 +181,13 @@ def run_initial_sync(
             if md5:
                 if md5 == existing.get("md5"):
                     already_tracked += 1
-                    skipped_files.append((file_id, file_data, rel_path, full_original))
+                    skipped_files.append((file_id, file_data, rel_path, bool(existing.get("extracted_path"))))
                     continue
             else:
                 # Google-native file — compare modifiedTime
                 if file_data.get("modifiedTime") == existing.get("modified_time"):
                     already_tracked += 1
-                    skipped_files.append((file_id, file_data, rel_path, full_original))
+                    skipped_files.append((file_id, file_data, rel_path, bool(existing.get("extracted_path"))))
                     continue
 
         last_user = file_data.get("lastModifyingUser", {})
@@ -176,8 +208,16 @@ def run_initial_sync(
     # Reconcile: verify idempotency-skipped files actually exist in git
     if skipped_files:
         tracked_set = set(repo.list_tracked_files())
-        for file_id, file_data, rel_path, full_original in skipped_files:
-            if full_original not in tracked_set:
+        for file_id, file_data, rel_path, expects_extracted in skipped_files:
+            missing_paths = _missing_git_paths(
+                tracked_set,
+                rel_path,
+                file_data.get("name", ""),
+                file_data.get("mimeType", ""),
+                cfg.docs_subdir,
+                include_extracted=expects_extracted,
+            )
+            if missing_paths:
                 last_user = file_data.get("lastModifyingUser", {})
                 changes.append(
                     Change(
@@ -189,7 +229,10 @@ def run_initial_sync(
                         author_email=last_user.get("emailAddress"),
                     )
                 )
-                logger.warning(f"Reconciliation: {full_original} tracked in Firestore but missing from git — re-adding")
+                logger.warning(
+                    "Reconciliation: %s tracked in Firestore but missing from git — re-adding",
+                    ", ".join(missing_paths),
+                )
 
     if not changes and not force:
         logger.info("All files already tracked — nothing to sync")
@@ -413,7 +456,7 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
 
     changes: list[Change] = []
     # Track files that Firestore considers unchanged for git verification
-    unchanged: list[tuple[str, dict, str]] = []  # (file_id, file_data, rel_path)
+    unchanged: list[tuple[str, dict, str, bool]] = []  # (file_id, file_data, rel_path, expects_extracted)
 
     # Use cached all_state for lookups (single Firestore read) instead
     # of individual get_file() calls for consistency and performance.
@@ -480,7 +523,7 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
                 )
             )
         else:
-            unchanged.append((file_id, file_data, rel_path))
+            unchanged.append((file_id, file_data, rel_path, bool(existing.get("extracted_path"))))
 
     # Detect deletes: files in Firestore but not in Drive listing.
     # Verify each candidate via files.get() to avoid false deletes from
@@ -510,12 +553,16 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
         repo.clone_or_init()
         cloned = True
         tracked_set = set(repo.list_tracked_files())
-        for file_id, file_data, rel_path in unchanged:
-            name = file_data.get("name", "")
-            mime_type = file_data.get("mimeType", "")
-            original, extracted = _git_paths(rel_path, name, mime_type)
-            full_original = os.path.join(cfg.docs_subdir, original) if cfg.docs_subdir else original
-            if full_original not in tracked_set:
+        for file_id, file_data, rel_path, expects_extracted in unchanged:
+            missing_paths = _missing_git_paths(
+                tracked_set,
+                rel_path,
+                file_data.get("name", ""),
+                file_data.get("mimeType", ""),
+                cfg.docs_subdir,
+                include_extracted=expects_extracted,
+            )
+            if missing_paths:
                 last_user = file_data.get("lastModifyingUser", {})
                 changes.append(
                     Change(
@@ -527,7 +574,10 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
                         author_email=last_user.get("emailAddress"),
                     )
                 )
-                logger.warning(f"Reconciliation: {full_original} tracked in Firestore but missing from git — re-adding")
+                logger.warning(
+                    "Reconciliation: %s tracked in Firestore but missing from git — re-adding",
+                    ", ".join(missing_paths),
+                )
 
     if not changes:
         logger.info("Diff sync: no changes detected")
@@ -841,7 +891,7 @@ def process_changes(
                 processed.append(change)
 
             elif change.change_type in (ChangeType.ADD, ChangeType.MODIFY):
-                _handle_add_or_modify(change, drive, repo, docs_subdir)
+                _handle_add_or_modify(change, drive, repo, state, docs_subdir)
                 processed.append(change)
 
         except Exception:
@@ -906,14 +956,17 @@ def _handle_rename(change: Change, drive: DriveClient, repo: GitRepo, state: Sta
                 not md5 and change.file_data.get("modifiedTime") != existing.get("modified_time")
             )
         if need_download:
-            _download_and_extract(change, drive, repo, docs_subdir)
+            stale_extracted = new_extracted if existing and existing.get("extracted_path") else None
+            _download_and_extract(change, drive, repo, docs_subdir, stale_extracted_path=stale_extracted)
 
     logger.info(f"Renamed {change.old_path} → {change.new_path}")
 
 
-def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, docs_subdir: str):
+def _handle_add_or_modify(change: Change, drive: DriveClient, repo: GitRepo, state: StateManager, docs_subdir: str):
     """Download file and extract text."""
-    _download_and_extract(change, drive, repo, docs_subdir)
+    existing = state.get_file(change.file_id)
+    stale_extracted = existing.get("extracted_path") if existing else None
+    _download_and_extract(change, drive, repo, docs_subdir, stale_extracted_path=stale_extracted)
     logger.info(f"{change.change_type.upper()} {change.new_path}")
 
 
@@ -926,7 +979,14 @@ def _is_not_downloadable(exc: Exception) -> bool:
     )
 
 
-def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, docs_subdir: str):
+def _download_and_extract(
+    change: Change,
+    drive: DriveClient,
+    repo: GitRepo,
+    docs_subdir: str,
+    *,
+    stale_extracted_path: str | None = None,
+):
     """Download a file from Drive, write original to repo, extract text alongside it."""
     file_data = change.file_data
     assert file_data is not None
@@ -977,10 +1037,13 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
     repo.write_file(os.path.join(docs_subdir, original_path), content)
 
     # Extract text
+    change.extracted_path_present = False
     extracted_name = get_extracted_filename(name, mime_type)
+    stale_sidecars = {stale_extracted_path} if stale_extracted_path else set()
     if extracted_name:
         dir_part = os.path.dirname(change.new_path) if "/" in change.new_path else ""
         extracted_rel = os.path.join(dir_part, extracted_name) if dir_part else extracted_name
+        stale_sidecars.add(extracted_rel)
 
         # Write to temp file for extraction
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(original_path)[1], delete=False) as tmp:
@@ -992,9 +1055,14 @@ def _download_and_extract(change: Change, drive: DriveClient, repo: GitRepo, doc
             if extract_text(tmp_path, extracted_tmp, mime_type):
                 with open(extracted_tmp, "rb") as f:
                     repo.write_file(os.path.join(docs_subdir, extracted_rel), f.read())
+                change.extracted_path_present = True
+                stale_sidecars.discard(extracted_rel)
                 os.unlink(extracted_tmp)
         finally:
             os.unlink(tmp_path)
+
+    for stale_sidecar in stale_sidecars:
+        repo.delete_file(os.path.join(docs_subdir, stale_sidecar))
 
 
 def group_by_author(changes: list[Change], cfg) -> list[AuthorCommit]:
@@ -1094,14 +1162,17 @@ def update_file_state(change: Change, state: StateManager):
         state_data["path"] = change.new_path or existing.get("path", "")
         if file_data.get("name"):
             state_data["name"] = file_data["name"]
-        # Recompute extracted_path
         name = state_data.get("name", "")
         mime_type = file_data.get("mimeType") or state_data.get("mime_type", "")
-        extracted_name = get_extracted_filename(name, mime_type)
-        dir_part = os.path.dirname(state_data["path"])
-        state_data["extracted_path"] = (
-            (os.path.join(dir_part, extracted_name) if dir_part else extracted_name) if extracted_name else None
-        )
+        _, extracted_path = _git_paths(state_data["path"], name, mime_type)
+        if change.extracted_path_present is True:
+            state_data["extracted_path"] = extracted_path
+        elif change.extracted_path_present is False:
+            state_data["extracted_path"] = None
+        elif existing.get("extracted_path"):
+            state_data["extracted_path"] = extracted_path
+        else:
+            state_data["extracted_path"] = None
         if file_data.get("md5Checksum"):
             state_data["md5"] = file_data["md5Checksum"]
         if file_data.get("modifiedTime"):
@@ -1119,9 +1190,9 @@ def update_file_state(change: Change, state: StateManager):
     name = file_data.get("name", "")
     mime_type = file_data.get("mimeType", "")
     path = change.new_path or ""
-    extracted_name = get_extracted_filename(name, mime_type)
-    dir_part = os.path.dirname(path) if "/" in path else ""
-    extracted_path = os.path.join(dir_part, extracted_name) if (extracted_name and dir_part) else extracted_name
+    _, extracted_path = _git_paths(path, name, mime_type)
+    if change.extracted_path_present is False:
+        extracted_path = None
 
     last_user = file_data.get("lastModifyingUser", {})
 
