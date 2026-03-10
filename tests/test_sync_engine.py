@@ -2820,7 +2820,7 @@ class TestRunDiffSyncLoop:
 
     @patch("sync_engine.extract_text")
     def test_diff_sync_skips_unchanged_file(self, mock_extract, mock_drive, mock_state):
-        """A file with matching md5 should NOT be treated as a change."""
+        """A file with matching md5 and present in git should NOT be re-downloaded."""
         from sync_engine import run_diff_sync
 
         drive_files = [
@@ -2844,14 +2844,19 @@ class TestRunDiffSyncLoop:
 
         self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
         mock_drive.get_file_path.return_value = "stable.txt"
+        mock_drive.get_folder_name.return_value = "MyDrive"
         mock_drive.get_start_page_token.return_value = "new_token"
 
         mock_repo = MagicMock()
+        # File exists in git — reconciliation should find it
+        mock_repo.list_tracked_files.return_value = ["MyDrive/stable.txt"]
 
         result = run_diff_sync(mock_drive, mock_state, mock_repo)
 
         assert result == 0
-        mock_repo.clone_or_init.assert_not_called()
+        # Clone IS called now for git verification, but no download happens
+        mock_repo.clone_or_init.assert_called_once()
+        mock_drive.download_file.assert_not_called()
 
     @patch("sync_engine.extract_text")
     def test_diff_sync_detects_rename(self, mock_extract, mock_drive, mock_state):
@@ -2944,10 +2949,13 @@ class TestRunDiffSyncLoop:
 
         self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
         mock_drive.get_file_path.return_value = "keep.txt"
+        mock_drive.get_folder_name.return_value = "MyDrive"
         mock_state.get_file.return_value = {"name": "gone.txt", "path": "gone.txt", "mime_type": ""}
 
         mock_repo = MagicMock()
         mock_repo.has_staged_changes.return_value = True
+        # keep.txt exists in git — reconciliation should not re-add it
+        mock_repo.list_tracked_files.return_value = ["MyDrive/keep.txt"]
 
         result = run_diff_sync(mock_drive, mock_state, mock_repo)
 
@@ -3987,3 +3995,346 @@ class TestDownloadAndExtractFallback:
 
         mock_drive.export_file.assert_called_once_with("f1", "text/csv")
         mock_repo.write_file.assert_any_call("docs/Finance/Budget.csv", b"csv data")
+
+
+# ---------------------------------------------------------------------------
+# Git-vs-Firestore reconciliation — diff sync
+# ---------------------------------------------------------------------------
+
+
+class TestDiffSyncGitReconciliation:
+    """Verify diff sync detects Firestore-tracked files missing from git."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    def _setup_diff_sync(self, mock_drive, mock_state, drive_files, all_state):
+        """Common setup for diff sync tests."""
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_state.get_all_files.return_value = all_state
+        mock_drive.get_start_page_token.return_value = "new_token"
+        mock_drive.verify_file_deleted.return_value = True
+        mock_drive.get_folder_name.return_value = "MyDrive"
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_file_missing_from_git_is_redownloaded(self, mock_extract, mock_drive, mock_state):
+        """A file unchanged in Firestore+Drive but absent from git must be re-added."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "report.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "report.txt",
+                "path": "report.txt",
+                "md5": "same_md5",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "report.txt"
+        mock_drive.download_file.return_value = b"report content"
+
+        mock_repo = MagicMock()
+        # Git has NO files — the file is missing
+        mock_repo.list_tracked_files.return_value = []
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # Should clone and re-download the missing file
+        mock_repo.clone_or_init.assert_called_once()
+        mock_drive.download_file.assert_called_once_with("f1")
+        assert result >= 1
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_file_present_in_git_is_not_redownloaded(self, mock_extract, mock_drive, mock_state):
+        """A file unchanged AND present in git should NOT be re-downloaded."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "stable.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "stable.txt",
+                "path": "stable.txt",
+                "md5": "same_md5",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "stable.txt"
+
+        mock_repo = MagicMock()
+        # Git DOES have the file
+        mock_repo.list_tracked_files.return_value = ["MyDrive/stable.txt"]
+        mock_repo.has_staged_changes.return_value = False
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # Should NOT re-download
+        mock_drive.download_file.assert_not_called()
+        assert result == 0
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_file_missing_from_git_with_docs_subdir(self, mock_extract, mock_drive, mock_state, monkeypatch):
+        """Git reconciliation accounts for docs_subdir prefix in path matching."""
+        from sync_engine import run_diff_sync
+
+        monkeypatch.setenv("DOCS_SUBDIR", "Documents")
+        reset_config()
+
+        mock_extract.return_value = False
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "memo.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "memo.txt",
+                "path": "memo.txt",
+                "md5": "same_md5",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "memo.txt"
+        mock_drive.download_file.return_value = b"memo content"
+
+        mock_repo = MagicMock()
+        # Git has OTHER files but not this one (path would be Documents/memo.txt)
+        mock_repo.list_tracked_files.return_value = ["Documents/other.txt"]
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        mock_repo.clone_or_init.assert_called_once()
+        mock_drive.download_file.assert_called_once_with("f1")
+        assert result >= 1
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_google_native_file_missing_from_git(self, mock_extract, mock_drive, mock_state):
+        """A Google-native file (exported as .docx) missing from git is re-added."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "My Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "My Doc",
+                "path": "My Doc",
+                "md5": None,
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.return_value = "My Doc"
+        mock_drive.export_file.return_value = b"exported docx bytes"
+
+        mock_repo = MagicMock()
+        # Git does NOT have "MyDrive/My Doc.docx"
+        mock_repo.list_tracked_files.return_value = []
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        mock_repo.clone_or_init.assert_called_once()
+        mock_drive.export_file.assert_called_once()
+        assert result >= 1
+
+    @patch("sync_engine.extract_text")
+    def test_unchanged_file_missing_from_git_with_other_changes(self, mock_extract, mock_drive, mock_state):
+        """Reconciliation still heals missing files even when other changes exist."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+
+        # f1 is unchanged (same md5) but missing from git
+        # f2 is a brand new file (not in Firestore)
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "old_file.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+            {
+                "id": "f2",
+                "name": "new_file.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_new",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Bob", "emailAddress": "bob@co.com"},
+            },
+        ]
+        all_state = {
+            "f1": {
+                "name": "old_file.txt",
+                "path": "old_file.txt",
+                "md5": "same_md5",
+                "modified_time": "2025-01-01T00:00:00Z",
+            },
+            # f2 not in state -> classified as ADD
+        }
+
+        self._setup_diff_sync(mock_drive, mock_state, drive_files, all_state)
+        mock_drive.get_file_path.side_effect = lambda f: f["name"]
+        mock_drive.download_file.return_value = b"content"
+
+        mock_repo = MagicMock()
+        # Git has neither file
+        mock_repo.list_tracked_files.return_value = []
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # Both files should be processed: f2 as normal ADD, f1 as reconciliation ADD
+        assert result >= 2
+        assert mock_drive.download_file.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Git-vs-Firestore reconciliation — initial sync
+# ---------------------------------------------------------------------------
+
+
+class TestInitialSyncGitReconciliation:
+    """Verify initial sync detects idempotency-skipped files missing from git."""
+
+    @staticmethod
+    def _fake_extract_ok(input_path, output_path, mime_type=None):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("extracted content")
+        return True
+
+    @patch("sync_engine.extract_text")
+    def test_idempotency_skipped_file_missing_from_git_is_redownloaded(self, mock_extract, mock_drive, mock_state):
+        """A file skipped by idempotency but absent from git must be re-added."""
+        from sync_engine import run_initial_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = "MyDrive"
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "report.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_file_path.return_value = "report.txt"
+        mock_drive.download_file.return_value = b"report content"
+
+        # Firestore says file is already tracked with same md5 → idempotency skip
+        mock_state.get_file.return_value = {
+            "name": "report.txt",
+            "path": "report.txt",
+            "md5": "same_md5",
+            "modified_time": "2025-01-01T00:00:00Z",
+        }
+
+        mock_repo = MagicMock()
+        # But git does NOT have the file
+        mock_repo.list_tracked_files.return_value = []
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_initial_sync(mock_drive, mock_state, mock_repo)
+
+        # File should be re-downloaded even though Firestore says it's tracked
+        mock_drive.download_file.assert_called_once_with("f1")
+        assert result["count"] >= 1
+
+    @patch("sync_engine.extract_text")
+    def test_idempotency_skipped_file_present_in_git_not_redownloaded(self, mock_extract, mock_drive, mock_state):
+        """A file skipped by idempotency AND present in git should NOT be re-downloaded."""
+        from sync_engine import run_initial_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = "MyDrive"
+
+        drive_files = [
+            {
+                "id": "f1",
+                "name": "stable.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "same_md5",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            },
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_file_path.return_value = "stable.txt"
+
+        # Firestore says tracked with same md5
+        mock_state.get_file.return_value = {
+            "name": "stable.txt",
+            "path": "stable.txt",
+            "md5": "same_md5",
+            "modified_time": "2025-01-01T00:00:00Z",
+        }
+
+        mock_repo = MagicMock()
+        # Git DOES have the file
+        mock_repo.list_tracked_files.return_value = ["MyDrive/stable.txt"]
+        mock_repo.has_staged_changes.return_value = False
+
+        result = run_initial_sync(mock_drive, mock_state, mock_repo)
+
+        # Should NOT re-download
+        mock_drive.download_file.assert_not_called()
+        assert result["count"] == 0

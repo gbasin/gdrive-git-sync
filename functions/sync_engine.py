@@ -115,6 +115,8 @@ def run_initial_sync(
     # Build Change objects, skipping files already tracked in Firestore
     changes: list[Change] = []
     already_tracked = 0
+    # Track idempotency-skipped files for git verification
+    skipped_files: list[tuple[str, dict, str, str]] = []  # (file_id, file_data, rel_path, full_original)
     for file_data in all_files:
         file_id = file_data["id"]
 
@@ -147,11 +149,13 @@ def run_initial_sync(
             if md5:
                 if md5 == existing.get("md5"):
                     already_tracked += 1
+                    skipped_files.append((file_id, file_data, rel_path, full_original))
                     continue
             else:
                 # Google-native file — compare modifiedTime
                 if file_data.get("modifiedTime") == existing.get("modified_time"):
                     already_tracked += 1
+                    skipped_files.append((file_id, file_data, rel_path, full_original))
                     continue
 
         last_user = file_data.get("lastModifyingUser", {})
@@ -168,6 +172,24 @@ def run_initial_sync(
 
     # Clone (handles empty repos) — needed for both changes and orphan cleanup
     repo.clone_or_init()
+
+    # Reconcile: verify idempotency-skipped files actually exist in git
+    if skipped_files:
+        tracked_set = set(repo.list_tracked_files())
+        for file_id, file_data, rel_path, full_original in skipped_files:
+            if full_original not in tracked_set:
+                last_user = file_data.get("lastModifyingUser", {})
+                changes.append(
+                    Change(
+                        file_id=file_id,
+                        change_type=ChangeType.ADD,
+                        file_data=file_data,
+                        new_path=rel_path,
+                        author_name=last_user.get("displayName"),
+                        author_email=last_user.get("emailAddress"),
+                    )
+                )
+                logger.warning(f"Reconciliation: {full_original} tracked in Firestore but missing from git — re-adding")
 
     if not changes and not force:
         logger.info("All files already tracked — nothing to sync")
@@ -390,6 +412,8 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
         drive_map[f["id"]] = (f, rel_path)
 
     changes: list[Change] = []
+    # Track files that Firestore considers unchanged for git verification
+    unchanged: list[tuple[str, dict, str]] = []  # (file_id, file_data, rel_path)
 
     # Use cached all_state for lookups (single Firestore read) instead
     # of individual get_file() calls for consistency and performance.
@@ -435,31 +459,28 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
 
         # Content change
         md5 = file_data.get("md5Checksum")
+        is_changed = False
         if md5:
             if md5 != existing.get("md5"):
-                changes.append(
-                    Change(
-                        file_id=file_id,
-                        change_type=ChangeType.MODIFY,
-                        file_data=file_data,
-                        new_path=rel_path,
-                        author_name=author_name,
-                        author_email=author_email,
-                    )
-                )
+                is_changed = True
         else:
             # Google-native file — compare modifiedTime
             if file_data.get("modifiedTime") != existing.get("modified_time"):
-                changes.append(
-                    Change(
-                        file_id=file_id,
-                        change_type=ChangeType.MODIFY,
-                        file_data=file_data,
-                        new_path=rel_path,
-                        author_name=author_name,
-                        author_email=author_email,
-                    )
+                is_changed = True
+
+        if is_changed:
+            changes.append(
+                Change(
+                    file_id=file_id,
+                    change_type=ChangeType.MODIFY,
+                    file_data=file_data,
+                    new_path=rel_path,
+                    author_name=author_name,
+                    author_email=author_email,
                 )
+            )
+        else:
+            unchanged.append((file_id, file_data, rel_path))
 
     # Detect deletes: files in Firestore but not in Drive listing.
     # Verify each candidate via files.get() to avoid false deletes from
@@ -480,13 +501,42 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
     if skipped_deletes:
         logger.info(f"Diff sync: skipped {skipped_deletes} delete(s) — files still exist per files.get()")
 
+    # Reconcile: verify "unchanged" Firestore entries actually exist in git.
+    # If Firestore says a file is tracked but git doesn't have it, re-add it.
+    # Run this regardless of whether other changes exist — drift can co-occur
+    # with normal adds/modifies/renames.
+    cloned = False
+    if unchanged:
+        repo.clone_or_init()
+        cloned = True
+        tracked_set = set(repo.list_tracked_files())
+        for file_id, file_data, rel_path in unchanged:
+            name = file_data.get("name", "")
+            mime_type = file_data.get("mimeType", "")
+            original, extracted = _git_paths(rel_path, name, mime_type)
+            full_original = os.path.join(cfg.docs_subdir, original) if cfg.docs_subdir else original
+            if full_original not in tracked_set:
+                last_user = file_data.get("lastModifyingUser", {})
+                changes.append(
+                    Change(
+                        file_id=file_id,
+                        change_type=ChangeType.ADD,
+                        file_data=file_data,
+                        new_path=rel_path,
+                        author_name=last_user.get("displayName"),
+                        author_email=last_user.get("emailAddress"),
+                    )
+                )
+                logger.warning(f"Reconciliation: {full_original} tracked in Firestore but missing from git — re-adding")
+
     if not changes:
         logger.info("Diff sync: no changes detected")
         return 0
 
     logger.info(f"Diff sync: {len(changes)} changes detected")
 
-    repo.clone_or_init()
+    if not cloned:
+        repo.clone_or_init()
     processed, had_failures = process_changes(changes, drive, repo, state, cfg)
 
     if processed:
