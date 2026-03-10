@@ -8,6 +8,7 @@ import uuid
 
 import google.auth
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 from config import get_config
@@ -154,6 +155,9 @@ class DriveClient:
                         break
                     raise
 
+                if response.get("incompleteSearch"):
+                    logger.warning(f"Drive returned incompleteSearch for folder {folder_id}")
+
                 for f in response.get("files", []):
                     if f.get("mimeType") == FOLDER_MIME:
                         self._folder_cache[f["id"]] = f.get("name")
@@ -265,6 +269,29 @@ class DriveClient:
         except Exception:
             self._folder_cache[folder_id] = None
             return None
+
+    def verify_file_deleted(self, file_id: str) -> bool:
+        """Confirm a file is truly gone or trashed via direct lookup.
+
+        Returns True if the file should be treated as deleted (trashed,
+        permanently deleted, or inaccessible).  Returns False if the
+        file still exists and is not trashed — indicating the listing
+        was incomplete and the delete should be skipped.
+        """
+        try:
+            f = self.service.files().get(fileId=file_id, fields="trashed", supportsAllDrives=True).execute()
+            return bool(f.get("trashed", False))
+        except HttpError as e:
+            if e.resp.status in (404, 403):
+                # 404 = permanently deleted; 403 = lost access
+                return True
+            # Transient error (500, rate limit, etc.) — don't assume deleted
+            logger.warning(f"Transient error verifying file {file_id}: {e.resp.status}")
+            return False
+        except Exception:
+            # Network error or other failure — don't assume deleted
+            logger.warning(f"Failed to verify file {file_id}", exc_info=True)
+            return False
 
     def get_file_mime(self, file_id: str) -> str | None:
         """Fetch the authoritative mimeType for a file."""

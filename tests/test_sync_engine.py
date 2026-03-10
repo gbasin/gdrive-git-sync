@@ -2384,11 +2384,10 @@ class TestPageTokenPartialFailure:
 
 
 class TestWebhookDeleteGuard:
-    """Tests for the mass-delete safety guard in run_sync.
+    """Tests for the unconditional delete stripping in run_sync.
 
-    When DELETE changes exceed 5 AND represent > 50% of tracked files,
-    run_sync drops the deletes, calls set_deferred_deletes, and lets
-    diff sync reconcile later.
+    All deletes from the changes API are dropped because the API
+    falsely reports 'removed' for files in shared folders.
     """
 
     @staticmethod
@@ -2397,22 +2396,18 @@ class TestWebhookDeleteGuard:
             f.write("extracted content")
         return True
 
-    def _raw_change(self, file_id="fileId1", file_data=None):
-        return {"fileId": file_id, "file": file_data or _make_file_data()}
-
     @patch("sync_engine.extract_text")
-    def test_mass_deletes_dropped_non_deletes_processed(self, mock_extract, mock_drive, mock_state):
-        """When DELETE changes > 5 and > 50% of tracked, deletes are dropped
-        but non-delete changes are still processed."""
+    def test_all_deletes_stripped_non_deletes_processed(self, mock_extract, mock_drive, mock_state):
+        """ALL delete changes are stripped; non-delete changes are still processed."""
         from sync_engine import run_sync
 
         mock_extract.side_effect = self._fake_extract_ok
 
         mock_state.get_page_token.return_value = "token_1"
 
-        # Build 6 delete changes (trashed files) + 1 add change
+        # Build 2 delete changes (trashed files) + 1 add change
         raw_changes = []
-        for i in range(6):
+        for i in range(2):
             fid = f"del_{i}"
             raw_changes.append({"fileId": fid, "file": _make_file_data(name=f"del{i}.docx", trashed=True)})
 
@@ -2432,9 +2427,6 @@ class TestWebhookDeleteGuard:
 
         mock_state.get_file.side_effect = get_file_side_effect
 
-        # 10 total tracked files: 6 deletes / 10 = 60% > 50%
-        mock_state.get_all_files.return_value = {f"f{i}": {"name": f"f{i}.docx"} for i in range(10)}
-
         mock_repo = MagicMock()
         mock_repo.has_staged_changes.return_value = True
 
@@ -2442,17 +2434,41 @@ class TestWebhookDeleteGuard:
 
         # Only the add was processed (deletes were dropped)
         assert result == 1
-        mock_state.set_deferred_deletes.assert_called_once()
         mock_repo.clone_or_init.assert_called_once()
         mock_repo.push.assert_called_once()
 
-    def test_few_deletes_not_guarded(self, mock_drive, mock_state):
-        """When DELETE changes <= 5, all changes are processed normally."""
+    def test_single_delete_also_stripped(self, mock_drive, mock_state):
+        """Even a single delete is stripped from webhook sync."""
         from sync_engine import run_sync
 
         mock_state.get_page_token.return_value = "token_1"
 
-        # 3 deletes (below threshold of 5)
+        raw_changes = [{"fileId": "del_0", "file": _make_file_data(name="del0.docx", trashed=True)}]
+
+        mock_drive.list_changes.return_value = (raw_changes, "token_2")
+
+        def get_file_side_effect(file_id):
+            return {"name": f"{file_id}.docx", "path": f"Reports/{file_id}.docx"}
+
+        mock_state.get_file.side_effect = get_file_side_effect
+
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        # Delete was stripped, nothing left to process
+        assert result == 0
+        mock_state.set_page_token.assert_called_with("token_2")
+        mock_repo.clone_or_init.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_all_deletes_returns_zero_advances_token(self, mock_extract, mock_drive, mock_state):
+        """When all changes are deletes, returns 0 and advances the page token."""
+        from sync_engine import run_sync
+
+        mock_state.get_page_token.return_value = "token_1"
+
+        # 3 deletes, no other changes
         raw_changes = []
         for i in range(3):
             fid = f"del_{i}"
@@ -2465,82 +2481,12 @@ class TestWebhookDeleteGuard:
             return {"name": f"{file_id}.docx", "path": f"Reports/{file_id}.docx"}
 
         mock_state.get_file.side_effect = get_file_side_effect
-        mock_state.get_file.return_value = {"name": "file.docx", "path": "Reports/file.docx"}
-
-        # get_all_files should NOT be called since count <= 5
-        mock_repo = MagicMock()
-        mock_repo.has_staged_changes.return_value = True
-
-        result = run_sync(mock_drive, mock_state, mock_repo)
-
-        # Deletes are processed (guard not triggered)
-        mock_state.set_deferred_deletes.assert_not_called()
-        assert result == 3
-        mock_state.set_page_token.assert_called_with("token_2")
-
-    def test_deletes_over_5_but_under_50_percent_not_guarded(self, mock_drive, mock_state):
-        """When DELETE changes > 5 but <= 50% of tracked, all changes processed."""
-        from sync_engine import run_sync
-
-        mock_state.get_page_token.return_value = "token_1"
-
-        # 6 deletes
-        raw_changes = []
-        for i in range(6):
-            fid = f"del_{i}"
-            raw_changes.append({"fileId": fid, "file": _make_file_data(name=f"del{i}.docx", trashed=True)})
-
-        mock_drive.list_changes.return_value = (raw_changes, "token_2")
-        mock_drive.get_file_path.return_value = "Reports/file.docx"
-
-        def get_file_side_effect(file_id):
-            return {"name": f"{file_id}.docx", "path": f"Reports/{file_id}.docx"}
-
-        mock_state.get_file.side_effect = get_file_side_effect
-
-        # 20 tracked files: 6/20 = 30% < 50%, guard does not trigger
-        mock_state.get_all_files.return_value = {f"f{i}": {"name": f"f{i}.docx"} for i in range(20)}
-
-        mock_repo = MagicMock()
-        mock_repo.has_staged_changes.return_value = True
-
-        result = run_sync(mock_drive, mock_state, mock_repo)
-
-        mock_state.set_deferred_deletes.assert_not_called()
-        assert result == 6
-        mock_state.set_page_token.assert_called_with("token_2")
-
-    @patch("sync_engine.extract_text")
-    def test_all_deletes_guarded_returns_zero_advances_token(self, mock_extract, mock_drive, mock_state):
-        """When all changes are deletes and the guard triggers, returns 0
-        and advances the page token."""
-        from sync_engine import run_sync
-
-        mock_state.get_page_token.return_value = "token_1"
-
-        # 8 deletes, no other changes
-        raw_changes = []
-        for i in range(8):
-            fid = f"del_{i}"
-            raw_changes.append({"fileId": fid, "file": _make_file_data(name=f"del{i}.docx", trashed=True)})
-
-        mock_drive.list_changes.return_value = (raw_changes, "token_2")
-        mock_drive.get_file_path.return_value = "Reports/file.docx"
-
-        def get_file_side_effect(file_id):
-            return {"name": f"{file_id}.docx", "path": f"Reports/{file_id}.docx"}
-
-        mock_state.get_file.side_effect = get_file_side_effect
-
-        # 10 tracked: 8/10 = 80% > 50%, guard triggers
-        mock_state.get_all_files.return_value = {f"f{i}": {"name": f"f{i}.docx"} for i in range(10)}
 
         mock_repo = MagicMock()
 
         result = run_sync(mock_drive, mock_state, mock_repo)
 
         assert result == 0
-        mock_state.set_deferred_deletes.assert_called_once()
         # Page token is advanced even though no changes were processed
         mock_state.set_page_token.assert_called_with("token_2")
         # No clone/push since nothing was processed
@@ -2552,12 +2498,11 @@ class TestWebhookDeleteGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestDiffSyncDeferredDeletes:
-    """Tests for the deferred_deletes interaction in run_diff_sync.
+class TestDiffSyncDeleteVerification:
+    """Tests for per-file delete verification in run_diff_sync.
 
-    When webhook deferred deletes, diff sync should allow them through
-    (skipping its own 50% guard). When no deferral flag is set, the
-    normal safety threshold still applies.
+    Each file missing from the Drive listing is verified via
+    verify_file_deleted() before being treated as a delete.
     """
 
     @staticmethod
@@ -2567,94 +2512,131 @@ class TestDiffSyncDeferredDeletes:
         return True
 
     @patch("sync_engine.extract_text")
-    def test_deferred_flag_skips_delete_guard(self, mock_extract, mock_drive, mock_state):
-        """When has_deferred_deletes is True, the 50% delete guard is bypassed
-        and deletes are allowed through. The flag is cleared afterward."""
+    def test_verified_deletes_processed(self, mock_extract, mock_drive, mock_state):
+        """When verify_file_deleted returns True, deletes are processed."""
         from sync_engine import run_diff_sync
 
         mock_extract.side_effect = self._fake_extract_ok
 
-        # 10 files tracked in Firestore state
-        all_state = {f"f{i}": {"name": f"f{i}.docx", "path": f"f{i}.docx", "md5": f"md5_{i}"} for i in range(10)}
+        # 3 files tracked in Firestore state
+        all_state = {f"f{i}": {"name": f"f{i}.docx", "path": f"f{i}.docx", "md5": f"md5_{i}"} for i in range(3)}
         mock_state.get_all_files.return_value = all_state
 
-        # Drive listing returns only 2 files (8 are missing -> 8 deletes = 80%)
-        drive_files = []
-        for i in range(2):
-            drive_files.append(
-                {
-                    "id": f"f{i}",
-                    "name": f"f{i}.docx",
-                    "mimeType": "text/plain",
-                    "md5Checksum": f"md5_{i}",
-                    "modifiedTime": "2025-01-01T00:00:00Z",
-                    "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
-                }
-            )
+        # Drive listing returns only 1 file (2 are missing)
+        drive_files = [
+            {
+                "id": "f0",
+                "name": "f0.docx",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_0",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            }
+        ]
         mock_drive.list_all_files.return_value = drive_files
-        mock_drive.get_file_path.side_effect = [f"f{i}.docx" for i in range(2)]
+        mock_drive.get_file_path.return_value = "f0.docx"
         mock_drive.matches_exclude_pattern.return_value = False
         mock_drive.should_skip_file.return_value = None
-
-        # The webhook deferred deletes flag is set
-        mock_state.has_deferred_deletes.return_value = True
         mock_drive.get_start_page_token.return_value = "new_token"
+
+        # Both missing files are truly deleted
+        mock_drive.verify_file_deleted.return_value = True
 
         mock_repo = MagicMock()
         mock_repo.has_staged_changes.return_value = True
 
         result = run_diff_sync(mock_drive, mock_state, mock_repo)
 
-        # 8 deletes should have been allowed through (guard bypassed)
-        assert result == 8
-        # Flag should be cleared after the check
-        mock_state.clear_deferred_deletes.assert_called_once()
+        # 2 deletes should have been processed
+        assert result == 2
+        assert mock_drive.verify_file_deleted.call_count == 2
         mock_repo.push.assert_called_once()
 
     @patch("sync_engine.extract_text")
-    def test_no_deferred_flag_delete_guard_applies(self, mock_extract, mock_drive, mock_state):
-        """When has_deferred_deletes is False, the 50% delete guard blocks
-        mass deletes as false positives."""
+    def test_unverified_deletes_skipped(self, mock_extract, mock_drive, mock_state):
+        """When verify_file_deleted returns False, deletes are skipped."""
         from sync_engine import run_diff_sync
 
         mock_extract.side_effect = self._fake_extract_ok
 
-        # 10 files tracked in Firestore state
-        all_state = {f"f{i}": {"name": f"f{i}.docx", "path": f"f{i}.docx", "md5": f"md5_{i}"} for i in range(10)}
+        # 3 files tracked in Firestore state
+        all_state = {f"f{i}": {"name": f"f{i}.docx", "path": f"f{i}.docx", "md5": f"md5_{i}"} for i in range(3)}
         mock_state.get_all_files.return_value = all_state
 
-        # Drive listing returns only 2 files (8 deletes = 80%)
-        drive_files = []
-        for i in range(2):
-            drive_files.append(
-                {
-                    "id": f"f{i}",
-                    "name": f"f{i}.docx",
-                    "mimeType": "text/plain",
-                    "md5Checksum": f"md5_{i}",
-                    "modifiedTime": "2025-01-01T00:00:00Z",
-                    "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
-                }
-            )
+        # Drive listing returns only 1 file (2 are missing)
+        drive_files = [
+            {
+                "id": "f0",
+                "name": "f0.docx",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_0",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            }
+        ]
         mock_drive.list_all_files.return_value = drive_files
-        mock_drive.get_file_path.side_effect = [f"f{i}.docx" for i in range(2)]
+        mock_drive.get_file_path.return_value = "f0.docx"
         mock_drive.matches_exclude_pattern.return_value = False
         mock_drive.should_skip_file.return_value = None
-
-        # No deferred deletes flag
-        mock_state.has_deferred_deletes.return_value = False
         mock_drive.get_start_page_token.return_value = "new_token"
+
+        # Files still exist (incomplete listing)
+        mock_drive.verify_file_deleted.return_value = False
 
         mock_repo = MagicMock()
         mock_repo.has_staged_changes.return_value = True
 
         result = run_diff_sync(mock_drive, mock_state, mock_repo)
 
-        # Deletes should be blocked (0 changes processed since all non-delete
-        # files match state, and deletes are dropped by the guard)
+        # 0 changes: existing file matches state, deletes were skipped
         assert result == 0
-        mock_state.clear_deferred_deletes.assert_not_called()
+        assert mock_drive.verify_file_deleted.call_count == 2
         mock_repo.push.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_mixed_verified_and_unverified(self, mock_extract, mock_drive, mock_state):
+        """When some files are truly deleted and some are not, only verified
+        deletes are processed."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.side_effect = self._fake_extract_ok
+
+        # 4 files tracked in Firestore state
+        all_state = {f"f{i}": {"name": f"f{i}.docx", "path": f"f{i}.docx", "md5": f"md5_{i}"} for i in range(4)}
+        mock_state.get_all_files.return_value = all_state
+
+        # Drive listing returns only 1 file (3 are missing)
+        drive_files = [
+            {
+                "id": "f0",
+                "name": "f0.docx",
+                "mimeType": "text/plain",
+                "md5Checksum": "md5_0",
+                "modifiedTime": "2025-01-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            }
+        ]
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.get_file_path.return_value = "f0.docx"
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_start_page_token.return_value = "new_token"
+
+        # f1 is truly deleted, f2 and f3 still exist
+        def verify_side_effect(file_id):
+            return file_id == "f1"
+
+        mock_drive.verify_file_deleted.side_effect = verify_side_effect
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        # Only 1 delete processed (f1)
+        assert result == 1
+        assert mock_drive.verify_file_deleted.call_count == 3
+        mock_repo.push.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2731,8 +2713,8 @@ class TestRunDiffSyncLoop:
         mock_drive.matches_exclude_pattern.return_value = False
         mock_drive.should_skip_file.return_value = None
         mock_state.get_all_files.return_value = all_state
-        mock_state.has_deferred_deletes.return_value = False
         mock_drive.get_start_page_token.return_value = "new_token"
+        mock_drive.verify_file_deleted.return_value = True
 
     @patch("sync_engine.extract_text")
     def test_diff_sync_detects_new_file_as_add(self, mock_extract, mock_drive, mock_state):
@@ -3021,7 +3003,6 @@ class TestRunDiffSyncLoop:
         mock_drive.matches_exclude_pattern.return_value = True  # excluded
         mock_drive.should_skip_file.return_value = None
         mock_state.get_all_files.return_value = {}
-        mock_state.has_deferred_deletes.return_value = False
         mock_drive.get_start_page_token.return_value = "new_token"
 
         mock_repo = MagicMock()
@@ -3050,7 +3031,6 @@ class TestRunDiffSyncLoop:
         mock_drive.matches_exclude_pattern.return_value = False
         mock_drive.should_skip_file.return_value = "file too large"
         mock_state.get_all_files.return_value = {}
-        mock_state.has_deferred_deletes.return_value = False
         mock_drive.get_start_page_token.return_value = "new_token"
 
         mock_repo = MagicMock()
