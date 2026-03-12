@@ -346,9 +346,10 @@ class TestExtractPdf:
 class TestExtractDocx:
     """Tests for DOCX extraction with mocked pypandoc."""
 
+    @patch("text_extractor.preprocess_docx", side_effect=lambda p: p)
     @patch("text_extractor.pypandoc")
     @patch("text_extractor.postprocess")
-    def test_returns_postprocessed_output(self, mock_postprocess, mock_pypandoc):
+    def test_returns_postprocessed_output(self, mock_postprocess, mock_pypandoc, _mock_preprocess):
         mock_pypandoc.convert_file.return_value = "raw pandoc output"
         mock_postprocess.return_value = "cleaned output"
 
@@ -363,9 +364,10 @@ class TestExtractDocx:
         )
         mock_postprocess.assert_called_once_with("raw pandoc output")
 
+    @patch("text_extractor.preprocess_docx", side_effect=lambda p: p)
     @patch("text_extractor.pypandoc")
     @patch("text_extractor.postprocess")
-    def test_passes_through_pandoc_errors(self, mock_postprocess, mock_pypandoc):
+    def test_passes_through_pandoc_errors(self, mock_postprocess, mock_pypandoc, _mock_preprocess):
         mock_pypandoc.convert_file.side_effect = RuntimeError("pandoc failed")
 
         with pytest.raises(RuntimeError, match="pandoc failed"):
@@ -585,9 +587,10 @@ class TestExtractPdfEdgeCases:
 class TestExtractDocxEdgeCases:
     """Edge cases for DOCX extraction: corrupted files, empty content."""
 
+    @patch("text_extractor.preprocess_docx", side_effect=lambda p: p)
     @patch("text_extractor.postprocess")
     @patch("text_extractor.pypandoc")
-    def test_corrupted_docx_caught_gracefully(self, mock_pypandoc, mock_postprocess, tmp_path):
+    def test_corrupted_docx_caught_gracefully(self, mock_pypandoc, mock_postprocess, _mock_preprocess, tmp_path):
         """A corrupted DOCX that causes pypandoc to raise RuntimeError should
         be caught by extract_text, returning False without crashing."""
         mock_pypandoc.convert_file.side_effect = RuntimeError("Invalid docx file")
@@ -598,9 +601,10 @@ class TestExtractDocxEdgeCases:
         assert result is False
         assert not output.exists()
 
+    @patch("text_extractor.preprocess_docx", side_effect=lambda p: p)
     @patch("text_extractor.postprocess")
     @patch("text_extractor.pypandoc")
-    def test_empty_docx_returns_empty_string(self, mock_pypandoc, mock_postprocess, tmp_path):
+    def test_empty_docx_returns_empty_string(self, mock_pypandoc, mock_postprocess, _mock_preprocess, tmp_path):
         """A DOCX with no content produces an empty output file and returns True."""
         mock_pypandoc.convert_file.return_value = ""
         mock_postprocess.return_value = ""

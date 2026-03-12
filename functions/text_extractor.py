@@ -12,6 +12,7 @@ import os
 import pdfplumber
 import pypandoc
 
+from docx_preprocess import preprocess_docx
 from pandoc_postprocess import postprocess
 
 logger = logging.getLogger(__name__)
@@ -90,12 +91,17 @@ def extract_text(file_path: str, output_path: str, mime_type: str | None = None)
 
 def extract_docx(file_path: str) -> str:
     """Convert docx to markdown using pandoc with track changes support."""
-    output = pypandoc.convert_file(
-        file_path,
-        "markdown",
-        format="docx",
-        extra_args=["--track-changes=all", "--wrap=none"],
-    )
+    fixed_path = preprocess_docx(file_path)
+    try:
+        output = pypandoc.convert_file(
+            fixed_path,
+            "markdown",
+            format="docx",
+            extra_args=["--track-changes=all", "--wrap=none"],
+        )
+    finally:
+        if fixed_path != file_path:
+            os.unlink(fixed_path)
     return postprocess(output)
 
 

@@ -49,7 +49,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["config", "drive_client", "git_ops", "state_manager", "sync_engine", "text_extractor", "pandoc_postprocess"]
+known-first-party = ["config", "docx_preprocess", "drive_client", "git_ops", "state_manager", "sync_engine", "text_extractor", "pandoc_postprocess"]
 
 [tool.mypy]
 python_version = "3.12"
