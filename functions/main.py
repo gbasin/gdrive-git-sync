@@ -146,6 +146,7 @@ def _run_sync_loop(state: StateManager, max_iterations: int = 3, *, allow_diff_s
             # change feed misses (shared folders), without the risk of false
             # deletes from transient Drive API issues on every webhook.
             if count == 0 and i == 0 and allow_diff_sync:
+                logger.info("Changes API returned 0 on safety-net/manual trigger — falling back to diff sync")
                 diff_count = run_diff_sync(drive, state, repo)
                 if diff_count > 0:
                     logger.info(f"Diff sync found {diff_count} changes missed by changes API")

@@ -165,6 +165,8 @@ class GitRepo:
         full_path = os.path.join(self.repo_path, rel_path)
         if os.path.exists(full_path):
             self._run(["git", "rm", "-f", "--", rel_path])
+        else:
+            logger.warning("delete_file: not on disk, skipping git rm: %s", rel_path)
 
     def stage_file(self, rel_path: str, ignore_missing: bool = False):
         """Stage a specific file (git add).

@@ -273,20 +273,27 @@ class DriveClient:
     def verify_file_deleted(self, file_id: str) -> bool:
         """Confirm a file is truly gone or trashed via direct lookup.
 
-        Returns True if the file should be treated as deleted (trashed,
-        permanently deleted, or inaccessible).  Returns False if the
-        file still exists and is not trashed — indicating the listing
-        was incomplete and the delete should be skipped.
+        Returns True only for trashed or permanently deleted (404) files.
+        Returns False for access errors (403) and transient failures —
+        the file may still exist and the listing may have been incomplete.
         """
         try:
             f = self.service.files().get(fileId=file_id, fields="trashed", supportsAllDrives=True).execute()
-            return bool(f.get("trashed", False))
+            trashed = bool(f.get("trashed", False))
+            if trashed:
+                logger.info(f"verify_file_deleted({file_id}): trashed=True — confirmed deleted")
+            return trashed
         except HttpError as e:
-            if e.resp.status in (404, 403):
-                # 404 = permanently deleted; 403 = lost access
+            if e.resp.status == 404:
+                logger.info(f"verify_file_deleted({file_id}): 404 — confirmed deleted")
                 return True
+            if e.resp.status == 403:
+                # 403 = lost access, not necessarily deleted.  For shared
+                # folders the SA can transiently lose per-file access.
+                logger.warning(f"verify_file_deleted({file_id}): 403 — treating as still alive")
+                return False
             # Transient error (500, rate limit, etc.) — don't assume deleted
-            logger.warning(f"Transient error verifying file {file_id}: {e.resp.status}")
+            logger.warning(f"verify_file_deleted({file_id}): HTTP {e.resp.status} — treating as still alive")
             return False
         except Exception:
             # Network error or other failure — don't assume deleted

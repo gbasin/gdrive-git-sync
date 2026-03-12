@@ -230,7 +230,8 @@ def run_initial_sync(
                     )
                 )
                 logger.warning(
-                    "Reconciliation: %s tracked in Firestore but missing from git — re-adding",
+                    "Reconciliation: file_id=%s paths=%s tracked in Firestore but missing from git — re-adding",
+                    file_id,
                     ", ".join(missing_paths),
                 )
 
@@ -341,6 +342,11 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     for file_id, raw in deduped.items():
         result = classify_change(file_id, raw, drive, state)
         if result is None:
+            logger.debug(
+                "classify_change returned None for file_id=%s name=%s",
+                file_id,
+                raw.get("file", {}).get("name", "<removed>"),
+            )
             continue
         if isinstance(result, list):
             changes.extend(c for c in result if c.change_type != ChangeType.SKIP)
@@ -532,6 +538,7 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
     for file_id, data in all_state.items():
         if file_id not in drive_map:
             if drive.verify_file_deleted(file_id):
+                logger.info("Diff sync: confirmed delete file_id=%s path=%s", file_id, data.get("path"))
                 changes.append(
                     Change(
                         file_id=file_id,
@@ -540,6 +547,7 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
                     )
                 )
             else:
+                logger.debug("Diff sync: skipped delete file_id=%s path=%s — still alive", file_id, data.get("path"))
                 skipped_deletes += 1
     if skipped_deletes:
         logger.info(f"Diff sync: skipped {skipped_deletes} delete(s) — files still exist per files.get()")
@@ -575,7 +583,8 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
                     )
                 )
                 logger.warning(
-                    "Reconciliation: %s tracked in Firestore but missing from git — re-adding",
+                    "Reconciliation: file_id=%s paths=%s tracked in Firestore but missing from git — re-adding",
+                    file_id,
                     ", ".join(missing_paths),
                 )
 

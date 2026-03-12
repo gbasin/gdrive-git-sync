@@ -121,9 +121,11 @@ class StateManager:
         return doc.to_dict() if doc.exists else None
 
     def set_file(self, file_id: str, data: dict):
+        logger.debug("set_file(%s) path=%s md5=%s", file_id, data.get("path"), data.get("md5"))
         self._file_ref(file_id).set(data)
 
     def delete_file(self, file_id: str):
+        logger.debug("delete_file(%s)", file_id)
         self._file_ref(file_id).delete()
 
     def get_all_files(self) -> dict[str, dict]:
