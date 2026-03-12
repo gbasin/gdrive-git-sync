@@ -219,9 +219,14 @@ class DriveClient:
                 parent_parents = parent.get("parents", [])
                 to_check.extend(parent_parents)
             except Exception:
-                logger.debug(f"Could not fetch parent {parent_id}")
+                logger.warning(f"is_in_folder: could not fetch parent {parent_id} for file {file_data.get('id')}")
                 continue
 
+        logger.info(
+            "is_in_folder: False for file_id=%s name=%s — parent chain did not reach root",
+            file_data.get("id"),
+            file_data.get("name"),
+        )
         return False
 
     def get_file_path(self, file_data: dict) -> str:

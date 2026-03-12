@@ -342,8 +342,8 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
     for file_id, raw in deduped.items():
         result = classify_change(file_id, raw, drive, state)
         if result is None:
-            logger.debug(
-                "classify_change returned None for file_id=%s name=%s",
+            logger.info(
+                "classify_change returned None for file_id=%s name=%s — filtered out",
                 file_id,
                 raw.get("file", {}).get("name", "<removed>"),
             )
@@ -776,6 +776,7 @@ def classify_change(file_id: str, raw: dict, drive: DriveClient, state: StateMan
                 author_email=author_email,
             )
 
+    logger.info("classify_change: SKIP file_id=%s path=%s — no content change", file_id, rel_path)
     return Change(file_id=file_id, change_type=ChangeType.SKIP)
 
 
