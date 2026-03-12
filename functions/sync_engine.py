@@ -88,6 +88,7 @@ class Change:
     author_name: str | None = None
     author_email: str | None = None
     extracted_path_present: bool | None = None
+    preserve_repo_files: bool = False
 
 
 @dataclass
@@ -96,6 +97,253 @@ class AuthorCommit:
     author_email: str
     message: str
     files: list["Change"] = field(default_factory=list)
+
+
+def _path_key(path: str) -> str:
+    """Normalize repo paths for collision checks.
+
+    Git history needs to stay portable across case-sensitive and case-insensitive
+    environments, so we treat case-only differences as the same destination.
+    """
+    return path.casefold()
+
+
+def _safe_get_all_files(state: StateManager) -> dict[str, dict]:
+    """Best-effort Firestore snapshot for planning logic.
+
+    Production StateManager always returns a dict, but tests often use bare
+    MagicMocks. Falling back to {} keeps the planner harmless in those cases.
+    """
+    try:
+        all_files = state.get_all_files()
+    except Exception:
+        return {}
+    return all_files if isinstance(all_files, dict) else {}
+
+
+def _state_git_paths(data: dict, docs_subdir: str) -> list[str]:
+    """Return the repo paths currently owned by a tracked state row."""
+    logical_path = data.get("path", "")
+    if not logical_path:
+        return []
+    name = data.get("name", os.path.basename(logical_path))
+    mime_type = data.get("mime_type", "")
+    include_extracted = bool(data.get("extracted_path"))
+    return _full_git_paths(logical_path, name, mime_type, docs_subdir, include_extracted=include_extracted)
+
+
+def _change_old_git_paths(change: Change, state_snapshot: dict[str, dict], docs_subdir: str) -> list[str]:
+    """Return repo paths currently owned by the file before the change."""
+    existing = state_snapshot.get(change.file_id)
+    if existing:
+        return _state_git_paths(existing, docs_subdir)
+    if not change.old_path:
+        return []
+    name = os.path.basename(change.old_path)
+    return _full_git_paths(change.old_path, name, "", docs_subdir, include_extracted=False)
+
+
+def _change_new_git_paths(change: Change, state_snapshot: dict[str, dict], docs_subdir: str) -> list[str]:
+    """Return repo paths the file would own after the change."""
+    if not change.new_path:
+        return []
+
+    if change.file_data:
+        name = change.file_data.get("name", os.path.basename(change.new_path))
+        mime_type = change.file_data.get("mimeType", "")
+        return _full_git_paths(change.new_path, name, mime_type, docs_subdir)
+
+    existing = state_snapshot.get(change.file_id)
+    if existing:
+        name = existing.get("name", os.path.basename(change.new_path))
+        mime_type = existing.get("mime_type", "")
+        include_extracted = bool(existing.get("extracted_path"))
+        return _full_git_paths(change.new_path, name, mime_type, docs_subdir, include_extracted=include_extracted)
+
+    return [os.path.join(docs_subdir, change.new_path) if docs_subdir else change.new_path]
+
+
+class _PathOwnershipTracker:
+    """Tracks repo-path ownership for one sync planning pass."""
+
+    def __init__(self):
+        self.file_to_paths: dict[str, set[str]] = {}
+        self.path_to_files: dict[str, set[str]] = {}
+
+    @classmethod
+    def from_state(cls, state_snapshot: dict[str, dict], docs_subdir: str) -> "_PathOwnershipTracker":
+        tracker = cls()
+        for file_id, data in state_snapshot.items():
+            tracker.set_file_paths(file_id, _state_git_paths(data, docs_subdir))
+        return tracker
+
+    def set_file_paths(self, file_id: str, paths: list[str]) -> None:
+        self.remove_file(file_id)
+        keys = {_path_key(path) for path in paths}
+        if not keys:
+            return
+        self.file_to_paths[file_id] = keys
+        for key in keys:
+            self.path_to_files.setdefault(key, set()).add(file_id)
+
+    def remove_file(self, file_id: str) -> None:
+        keys = self.file_to_paths.pop(file_id, set())
+        for key in keys:
+            owners = self.path_to_files.get(key)
+            if not owners:
+                continue
+            owners.discard(file_id)
+            if not owners:
+                self.path_to_files.pop(key, None)
+
+    def owners_of(self, paths: list[str], *, exclude_file_id: str | None = None) -> set[str]:
+        owners: set[str] = set()
+        for path in paths:
+            owners.update(self.path_to_files.get(_path_key(path), set()))
+        if exclude_file_id is not None:
+            owners.discard(exclude_file_id)
+        return owners
+
+
+def _owner_is_stale(
+    owner_id: str,
+    drive: DriveClient,
+    *,
+    known_live_ids: set[str],
+    confirmed_deleted_ids: set[str],
+    verify_cache: dict[str, bool],
+) -> bool:
+    """Return True if an incumbent owner is confirmed stale."""
+    if owner_id in known_live_ids:
+        return False
+    if owner_id in confirmed_deleted_ids:
+        return True
+    if owner_id not in verify_cache:
+        verify_cache[owner_id] = drive.verify_file_deleted(owner_id)
+    if verify_cache[owner_id]:
+        confirmed_deleted_ids.add(owner_id)
+    return verify_cache[owner_id]
+
+
+def _incoming_conflict_file_ids(changes: list[Change], state_snapshot: dict[str, dict], docs_subdir: str) -> set[str]:
+    """Return file IDs whose incoming destination overlaps another incoming change."""
+    path_to_incoming: dict[str, set[str]] = {}
+    for change in changes:
+        if change.change_type == ChangeType.DELETE:
+            continue
+        for path in _change_new_git_paths(change, state_snapshot, docs_subdir):
+            path_to_incoming.setdefault(_path_key(path), set()).add(change.file_id)
+
+    conflicts: set[str] = set()
+    for owners in path_to_incoming.values():
+        if len(owners) > 1:
+            conflicts.update(owners)
+    return conflicts
+
+
+def _plan_safe_changes(
+    changes: list[Change],
+    state_snapshot: dict[str, dict],
+    drive: DriveClient,
+    docs_subdir: str,
+    *,
+    known_live_ids: set[str] | None = None,
+    confirmed_deleted_ids: set[str] | None = None,
+) -> list[Change]:
+    """Resolve stale incumbents and drop unresolved repo-path collisions.
+
+    The planner is deliberately conservative:
+    - stale incumbents become state-only DELETEs
+    - unresolved/live collisions are skipped before they can touch git
+    """
+    known_live_ids = set(known_live_ids or set())
+    confirmed_deleted_ids = set(confirmed_deleted_ids or set())
+    verify_cache: dict[str, bool] = {}
+    tracker = _PathOwnershipTracker.from_state(state_snapshot, docs_subdir)
+    incoming_conflicts = _incoming_conflict_file_ids(changes, state_snapshot, docs_subdir)
+    planned: list[Change] = []
+    cleanup_scheduled: set[str] = set()
+
+    for change in changes:
+        if change.change_type == ChangeType.DELETE:
+            if change.file_id in cleanup_scheduled:
+                continue
+            current_paths = _change_old_git_paths(change, state_snapshot, docs_subdir)
+            other_owners = tracker.owners_of(current_paths, exclude_file_id=change.file_id)
+            if other_owners:
+                change.preserve_repo_files = True
+                logger.warning(
+                    "Path collision: file_id=%s delete will preserve repo files still owned by %s",
+                    change.file_id,
+                    ", ".join(sorted(other_owners)),
+                )
+            tracker.remove_file(change.file_id)
+            planned.append(change)
+            continue
+
+        if change.file_id in incoming_conflicts:
+            logger.warning(
+                "Path collision: skipping %s for file_id=%s path=%s because another incoming change targets the same repo path",
+                change.change_type,
+                change.file_id,
+                change.new_path,
+            )
+            continue
+
+        if change.change_type in (ChangeType.RENAME, ChangeType.MOVE):
+            tracker.remove_file(change.file_id)
+
+        target_paths = _change_new_git_paths(change, state_snapshot, docs_subdir)
+        conflicting_owners = tracker.owners_of(target_paths, exclude_file_id=change.file_id)
+
+        for owner_id in sorted(conflicting_owners):
+            if owner_id in cleanup_scheduled:
+                continue
+            if not _owner_is_stale(
+                owner_id,
+                drive,
+                known_live_ids=known_live_ids,
+                confirmed_deleted_ids=confirmed_deleted_ids,
+                verify_cache=verify_cache,
+            ):
+                continue
+
+            stale = state_snapshot.get(owner_id, {})
+            cleanup = Change(
+                file_id=owner_id,
+                change_type=ChangeType.DELETE,
+                old_path=stale.get("path"),
+                author_name=change.author_name,
+                author_email=change.author_email,
+                preserve_repo_files=True,
+            )
+            cleanup_scheduled.add(owner_id)
+            tracker.remove_file(owner_id)
+            planned.append(cleanup)
+            logger.warning(
+                "Path collision: removing stale owner file_id=%s so file_id=%s can claim path=%s",
+                owner_id,
+                change.file_id,
+                change.new_path,
+            )
+
+        remaining_owners = tracker.owners_of(target_paths, exclude_file_id=change.file_id)
+        if remaining_owners:
+            logger.warning(
+                "Path collision: skipping %s for file_id=%s path=%s because repo path is still owned by %s",
+                change.change_type,
+                change.file_id,
+                change.new_path,
+                ", ".join(sorted(remaining_owners)),
+            )
+            if change.change_type in (ChangeType.RENAME, ChangeType.MOVE):
+                tracker.set_file_paths(change.file_id, _change_old_git_paths(change, state_snapshot, docs_subdir))
+            continue
+
+        tracker.set_file_paths(change.file_id, target_paths)
+        planned.append(change)
+
+    return planned
 
 
 def _resolve_docs_subdir(drive: DriveClient, cfg) -> None:
@@ -134,6 +382,7 @@ def run_initial_sync(
     cfg = get_config()
     _resolve_docs_subdir(drive, cfg)
     debug: dict[str, object] = {"folder_id": cfg.drive_folder_id}
+    state_snapshot: dict[str, dict] = {}
 
     all_files = drive.list_all_files()
     debug["files_listed"] = len(all_files)
@@ -141,6 +390,8 @@ def run_initial_sync(
     if force:
         logger.info("Force flag set — clearing tracked file state")
         state.clear_all_files()
+    else:
+        state_snapshot = _safe_get_all_files(state)
 
     if not all_files and not force:
         logger.info("No files found in Drive folder")
@@ -237,6 +488,19 @@ def run_initial_sync(
 
     if not changes and not force:
         logger.info("All files already tracked — nothing to sync")
+        debug["already_tracked"] = already_tracked
+        return {"count": 0, "debug": debug}
+
+    changes = _plan_safe_changes(
+        changes,
+        state_snapshot,
+        drive,
+        cfg.docs_subdir,
+        known_live_ids={file_data["id"] for file_data in all_files if file_data.get("id")},
+    )
+
+    if not changes and not force:
+        logger.info("Initial sync: all pending changes were skipped due to path conflicts")
         debug["already_tracked"] = already_tracked
         return {"count": 0, "debug": debug}
 
@@ -362,6 +626,7 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
         else:
             seen[c.file_id] = c
     changes = list(seen.values())
+    state_snapshot = _safe_get_all_files(state)
 
     if not changes:
         state.set_page_token(new_token)
@@ -380,6 +645,19 @@ def run_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int:
         if not changes:
             state.set_page_token(new_token)
             return 0
+
+    changes = _plan_safe_changes(
+        changes,
+        state_snapshot,
+        drive,
+        cfg.docs_subdir,
+        known_live_ids={change.file_id for change in changes},
+    )
+
+    if not changes:
+        state.set_page_token(new_token)
+        logger.info("All changes were skipped after path conflict checks")
+        return 0
 
     logger.info(f"Processing {len(changes)} changes")
 
@@ -535,10 +813,12 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
     # Verify each candidate via files.get() to avoid false deletes from
     # incomplete listings.
     skipped_deletes = 0
+    confirmed_deleted_ids: set[str] = set()
     for file_id, data in all_state.items():
         if file_id not in drive_map:
             if drive.verify_file_deleted(file_id):
                 logger.info("Diff sync: confirmed delete file_id=%s path=%s", file_id, data.get("path"))
+                confirmed_deleted_ids.add(file_id)
                 changes.append(
                     Change(
                         file_id=file_id,
@@ -590,6 +870,19 @@ def run_diff_sync(drive: DriveClient, state: StateManager, repo: GitRepo) -> int
 
     if not changes:
         logger.info("Diff sync: no changes detected")
+        return 0
+
+    changes = _plan_safe_changes(
+        changes,
+        all_state,
+        drive,
+        cfg.docs_subdir,
+        known_live_ids=set(drive_map.keys()),
+        confirmed_deleted_ids=confirmed_deleted_ids,
+    )
+
+    if not changes:
+        logger.info("Diff sync: all pending changes were skipped due to path conflicts")
         return 0
 
     logger.info(f"Diff sync: {len(changes)} changes detected")
@@ -914,6 +1207,10 @@ def process_changes(
 def _handle_delete(change: Change, repo: GitRepo, state: StateManager, docs_subdir: str):
     """Delete both original and extracted files."""
     if not change.old_path:
+        return
+
+    if change.preserve_repo_files:
+        logger.info("Deleted state only for %s", change.old_path)
         return
 
     existing = state.get_file(change.file_id)

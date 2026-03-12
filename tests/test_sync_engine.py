@@ -1720,6 +1720,127 @@ class TestRunSync:
         mock_repo.unstage_all.assert_called_once()
         mock_repo.push.assert_called_once()
 
+    @patch("sync_engine.extract_text")
+    def test_run_sync_reclaims_path_from_confirmed_deleted_owner(self, mock_extract, mock_drive, mock_state):
+        """A new file can claim a path once the incumbent owner is confirmed deleted."""
+        from sync_engine import run_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = None
+
+        old_id = "old_owner"
+        new_id = "new_owner"
+        rel_path = "Reports/report.txt"
+        old_state = {
+            "name": "report.txt",
+            "path": rel_path,
+            "md5": "old_md5",
+            "mime_type": "text/plain",
+        }
+
+        def get_file_side_effect(file_id):
+            if file_id == new_id:
+                return None
+            if file_id == old_id:
+                return old_state
+            return None
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.side_effect = get_file_side_effect
+        mock_state.get_all_files.return_value = {old_id: old_state}
+
+        file_data = _make_file_data(name="report.txt", mime_type="text/plain", md5="new_md5")
+        mock_drive.list_changes.return_value = ([self._raw_change(file_id=new_id, file_data=file_data)], "token_2")
+        mock_drive.get_file_path.return_value = rel_path
+        mock_drive.download_file.return_value = b"new content"
+        mock_drive.verify_file_deleted.side_effect = lambda file_id: file_id == old_id
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 2
+        mock_drive.download_file.assert_called_once_with(new_id)
+        mock_repo.delete_file.assert_not_called()
+        mock_state.delete_file.assert_called_once_with(old_id)
+        mock_state.set_file.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_run_sync_skips_rename_into_occupied_destination(self, mock_extract, mock_drive, mock_state):
+        """A rename should be skipped rather than overwrite another tracked path owner."""
+        from sync_engine import run_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = None
+
+        file_a = "file_a"
+        file_b = "file_b"
+        source_path = "Folder/source.txt"
+        dest_path = "Folder/destination.txt"
+        state_rows = {
+            file_a: {"name": "source.txt", "path": source_path, "md5": "aaa", "mime_type": "text/plain"},
+            file_b: {"name": "destination.txt", "path": dest_path, "md5": "bbb", "mime_type": "text/plain"},
+        }
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.side_effect = lambda file_id: state_rows.get(file_id)
+        mock_state.get_all_files.return_value = state_rows
+
+        file_data = _make_file_data(name="destination.txt", mime_type="text/plain", md5="aaa")
+        mock_drive.list_changes.return_value = ([self._raw_change(file_id=file_a, file_data=file_data)], "token_2")
+        mock_drive.get_file_path.return_value = dest_path
+        mock_drive.verify_file_deleted.return_value = False
+
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_repo.clone_or_init.assert_not_called()
+        mock_repo.rename_file.assert_not_called()
+        mock_drive.download_file.assert_not_called()
+        mock_state.set_file.assert_not_called()
+        mock_state.delete_file.assert_not_called()
+
+    @patch("sync_engine.extract_text")
+    def test_run_sync_skips_google_export_collision(self, mock_extract, mock_drive, mock_state):
+        """A Google Doc export must not overwrite a binary file with the same repo path."""
+        from sync_engine import run_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = None
+
+        incumbent_id = "binary_docx"
+        incoming_id = "google_doc"
+        state_rows = {
+            incumbent_id: {
+                "name": "Budget.docx",
+                "path": "Folder/Budget.docx",
+                "md5": "bin_md5",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "extracted_path": "Folder/Budget.docx.md",
+            }
+        }
+
+        mock_state.get_page_token.return_value = "token_1"
+        mock_state.get_file.side_effect = lambda file_id: state_rows.get(file_id)
+        mock_state.get_all_files.return_value = state_rows
+
+        file_data = _make_file_data(name="Budget", mime_type="application/vnd.google-apps.document", md5=None)
+        mock_drive.list_changes.return_value = ([self._raw_change(file_id=incoming_id, file_data=file_data)], "token_2")
+        mock_drive.get_file_path.return_value = "Folder/Budget"
+        mock_drive.verify_file_deleted.return_value = False
+
+        mock_repo = MagicMock()
+
+        result = run_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 0
+        mock_repo.clone_or_init.assert_not_called()
+        mock_drive.export_file.assert_not_called()
+        mock_state.set_file.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # _handle_rename with content change
@@ -2687,6 +2808,61 @@ class TestDiffSyncDeleteVerification:
         assert result == 1
         assert mock_drive.verify_file_deleted.call_count == 3
         mock_repo.push.assert_called_once()
+
+    @patch("sync_engine.extract_text")
+    def test_diff_sync_delete_preserves_path_claimed_by_new_live_file(self, mock_extract, mock_drive, mock_state):
+        """A stale delete must not remove repo files now claimed by a new live file ID."""
+        from sync_engine import run_diff_sync
+
+        mock_extract.return_value = False
+        mock_drive.get_folder_name.return_value = None
+
+        old_id = "old_owner"
+        new_id = "new_owner"
+        rel_path = "Reports/report.txt"
+        all_state = {
+            old_id: {
+                "name": "report.txt",
+                "path": rel_path,
+                "md5": "old_md5",
+                "mime_type": "text/plain",
+            }
+        }
+        drive_files = [
+            {
+                "id": new_id,
+                "name": "report.txt",
+                "mimeType": "text/plain",
+                "md5Checksum": "new_md5",
+                "modifiedTime": "2025-06-01T00:00:00Z",
+                "lastModifyingUser": {"displayName": "Alice", "emailAddress": "alice@co.com"},
+            }
+        ]
+
+        mock_state.get_all_files.return_value = all_state
+        mock_drive.list_all_files.return_value = drive_files
+        mock_drive.get_file_path.return_value = rel_path
+        mock_drive.matches_exclude_pattern.return_value = False
+        mock_drive.should_skip_file.return_value = None
+        mock_drive.get_start_page_token.return_value = "new_token"
+        mock_drive.verify_file_deleted.side_effect = lambda file_id: file_id == old_id
+        mock_drive.download_file.return_value = b"new content"
+
+        def get_file_side_effect(file_id):
+            return all_state.get(file_id)
+
+        mock_state.get_file.side_effect = get_file_side_effect
+
+        mock_repo = MagicMock()
+        mock_repo.has_staged_changes.return_value = True
+
+        result = run_diff_sync(mock_drive, mock_state, mock_repo)
+
+        assert result == 2
+        mock_drive.download_file.assert_called_once_with(new_id)
+        mock_repo.delete_file.assert_not_called()
+        mock_state.delete_file.assert_called_once_with(old_id)
+        mock_state.set_file.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
