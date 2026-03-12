@@ -27,7 +27,6 @@ _R = f"{{{W_NS}}}r"
 
 _FIELD_TAGS = {_FLDCHAR, _INSTRTEXT}
 _TEXT_TAGS = {_T}
-_MIXED_TAGS = _FIELD_TAGS | _TEXT_TAGS
 
 
 def _register_namespaces(xml_bytes: bytes) -> None:
@@ -114,8 +113,8 @@ def preprocess_docx(file_path: str) -> str:
 
     with zipfile.ZipFile(file_path, "r") as zf:
         for name in zf.namelist():
-            # Process document.xml plus any headers/footers
-            if name.startswith("word/") and name.endswith(".xml"):
+            # Process document body parts (document, headers, footers, notes)
+            if re.match(r"word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml", name):
                 raw = zf.read(name)
                 if b"fldChar" not in raw:
                     continue

@@ -101,7 +101,10 @@ def extract_docx(file_path: str) -> str:
         )
     finally:
         if fixed_path != file_path:
-            os.unlink(fixed_path)
+            try:
+                os.unlink(fixed_path)
+            except OSError:
+                logger.warning("Failed to delete temp file %s", fixed_path)
     return postprocess(output)
 
 

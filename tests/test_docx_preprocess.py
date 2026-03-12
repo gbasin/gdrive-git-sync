@@ -1,9 +1,13 @@
 """Tests for functions/docx_preprocess.py."""
 
+import glob
 import os
 import tempfile
 import zipfile
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
+
+import pytest
 
 from docx_preprocess import W_NS, preprocess_docx, split_mixed_runs
 
@@ -364,6 +368,32 @@ class TestPreprocessDocx:
                 assert orig.read("[Content_Types].xml") == fixed.read("[Content_Types].xml")
                 assert orig.read("_rels/.rels") == fixed.read("_rels/.rels")
             os.unlink(result)
+        finally:
+            os.unlink(path)
+
+    def test_bad_zip_raises(self, tmp_path):
+        """A corrupt (non-zip) file should raise BadZipFile."""
+        bad_file = tmp_path / "bad.docx"
+        bad_file.write_bytes(b"this is not a zip")
+        with pytest.raises(zipfile.BadZipFile):
+            preprocess_docx(str(bad_file))
+
+    def test_temp_file_cleaned_up_on_pandoc_failure(self):
+        """If pandoc fails after preprocessing, the temp file should still be deleted."""
+        from text_extractor import extract_docx
+
+        path = _build_docx(_MIXED_RUN_DOC)
+        try:
+            # Snapshot temp .docx files before the call
+            before = set(glob.glob(os.path.join(tempfile.gettempdir(), "*.docx")))
+            with patch("text_extractor.pypandoc") as mock_pypandoc:
+                mock_pypandoc.convert_file.side_effect = RuntimeError("pandoc failed")
+                with pytest.raises(RuntimeError, match="pandoc failed"):
+                    extract_docx(path)
+            after = set(glob.glob(os.path.join(tempfile.gettempdir(), "*.docx")))
+            # No new temp files should remain
+            leaked = after - before
+            assert not leaked, f"Temp files leaked: {leaked}"
         finally:
             os.unlink(path)
 
